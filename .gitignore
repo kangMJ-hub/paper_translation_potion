@@ -1,0 +1,38 @@
+# 인증 / 환경변수
+.env
+*.json.key
+*credentials*.json
+service_account*.json
+GOOGLE_APPLICATION_CREDENTIALS
+
+# 출력물
+output/
+*.pdf
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# IDE / Tooling
+.vscode/
+.idea/
+*.swp
+.claude/
+*.local.yaml
+*.local.json
+
+# OS 생성 파일
+.DS_Store
+Thumbs.db

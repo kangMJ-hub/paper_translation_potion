@@ -1,0 +1,76 @@
+((# Physics-Trans v2.0 LaTeX template #))
+((*- if config.get('layout', 'onecolumn') == 'twocolumn' *))
+\documentclass[reprint,aps,prl]{((( document_class )))}
+((*- else *))
+\documentclass[reprint,aps,prl,onecolumn]{((( document_class )))}
+((*- endif *))
+\usepackage{fontspec}
+\usepackage{kotex}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{booktabs}
+
+\setmainfont[AutoFakeBold=1.5, AutoFakeSlant=0.2]{((( main_font )))}
+\setsansfont[AutoFakeBold=1.5, AutoFakeSlant=0.2]{((( sans_font )))}
+
+\renewcommand{\figurename}{그림}
+\renewcommand{\tablename}{표}
+
+\begin{document}
+
+\title{((( metadata.translated_title | escape_latex )))}
+\author{((( metadata.authors | escape_latex )))}
+
+\begin{abstract}
+((( abstract_text )))
+\end{abstract}
+
+\maketitle
+
+((*- for block in body_blocks *))
+
+((*- if block.type == 'section' *))
+\section{((( (block.translated_text or block.text) | escape_latex )))}
+
+((*- elif block.type == 'subsection' *))
+\subsection{((( (block.translated_text or block.text) | escape_latex )))}
+
+((*- elif block.type == 'paragraph' *))
+
+((( (block.translated_text or block.text) | escape_latex_text )))
+
+((*- elif block.type == 'equation' *))
+
+((( (block.translated_text or block.text) | format_equation )))
+
+((*- elif block.type == 'figure_caption' *))
+
+((( block | format_figure )))
+
+((*- elif block.type == 'table_caption' *))
+
+\begin{table}[htbp]
+\centering
+\caption{((( (block.translated_text or block.text) | escape_latex_text )))}
+\end{table}
+
+((*- elif block.type == 'table_data' *))
+((# 표 데이터는 현재 단순 출력 #))
+
+((*- endif *))
+
+((*- endfor *))
+
+((*- if reference_blocks *))
+\begin{thebibliography}{99}
+((*- for ref in reference_blocks *))
+\bibitem{} ((( ref.text | escape_latex )))
+
+((*- endfor *))
+\end{thebibliography}
+((*- endif *))
+
+\end{document}

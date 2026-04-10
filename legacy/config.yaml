@@ -1,0 +1,19 @@
+api:
+  key: AIzaSyBjMOhGf_W0AQXM0846uGv-aQt_FAFNnRI
+  model: gemini-3-flash-preview
+latex:
+  documentclass: article
+  font_main: HCR Batang
+  font_sans: Malgun Gothic
+  two_column: false
+rules:
+- 수식은 번역하지 않고 LaTeX 코드 그대로 유지한다.
+- '물리학 전문 용어는 가능하면 한국어로 번역하되, 혼동 우려가 있으면 영어 병기한다. 예: 해밀토니안(Hamiltonian)'
+- 논문의 학술적 문체를 유지한다.
+- 저자명, 기관명, 고유명사는 번역하지 않는다.
+- 그림 캡션과 표 캡션도 번역한다.
+- 참고문헌 항목은 번역하지 않고 원문 그대로 유지한다.
+translation:
+  source_language: English
+  style: 존댓말 (합니다체)
+  target_language: Korean

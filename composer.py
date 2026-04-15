@@ -147,12 +147,16 @@ def _render_template(translated: dict, config: dict) -> str:
             if is_citation:
                 reclassified.append({**b, "type": "reference"})
                 continue
+            # 전체가 $...$ 수식인 단락 → equation으로 승격
+            if _is_pure_eq_paragraph(b.get("translated_text") or text):
+                reclassified.append({**b, "type": "equation"})
+                continue
         reclassified.append(b)
     blocks = reclassified
 
     raw_body = [
         b for b in blocks
-        if b["type"] not in ("title", "authors", "abstract", "reference")
+        if b["type"] not in ("title", "authors", "abstract", "reference", "footnote")
         and not (b["type"] in ("section", "subsection") and _ref_heading.match(b.get("text", "").strip()))
     ]
     # table_caption + table_data 쌍을 하나의 'table' 블록으로 합침
@@ -185,6 +189,22 @@ def _render_template(translated: dict, config: dict) -> str:
         else:
             body_blocks.append(b)
             i += 1
+    # paragraph 앞부분 $...(N)$ + 한국어 설명 → display equation + paragraph 분리
+    split_body: list[dict] = []
+    for b in body_blocks:
+        if b["type"] == "paragraph":
+            t = b.get("translated_text") or b.get("text", "")
+            inner, eq_num, rest = _split_leading_equation(t)
+            if inner:
+                eq_text = f"{inner} \\tag{{{eq_num}}}" if eq_num else inner
+                split_body.append({**b, "type": "equation",
+                                   "translated_text": eq_text, "text": eq_text})
+                split_body.append({**b, "type": "paragraph",
+                                   "translated_text": rest, "text": rest})
+                continue
+        split_body.append(b)
+    body_blocks = split_body
+
     def _ref_sort_key(b):
         m = re.match(r"^\[(\d+)\]|^(\d+)[).]", b.get("text", "").strip())
         if m:
@@ -217,6 +237,63 @@ def _render_template(translated: dict, config: dict) -> str:
 # Jinja2 커스텀 필터
 # ---------------------------------------------------------------------------
 
+def _split_leading_equation(text: str) -> tuple[str, str | None, str]:
+    """
+    단락 텍스트가 $...(N)$ 으로 시작하고 뒤에 한국어 설명이 있을 때 분리한다.
+    반환: (eq_inner, eq_num_or_None, rest_text)
+    eq_inner가 빈 문자열이면 분리 불가.
+    """
+    stripped = (text or "").strip()
+    m = re.match(
+        r'^\$([^$]+)\$'           # 첫 번째 $...$
+        r'[,.\s]*(?:\((\d+)\))?'  # 선택적 수식번호 (N)
+        r'\s+(.+)',                # 나머지 텍스트 (최소 1자)
+        stripped, re.DOTALL
+    )
+    if not m:
+        return "", None, text
+    inner = m.group(1)
+    eq_num = m.group(2)
+    rest = m.group(3).strip()
+    # 나머지에 한국어가 있어야 의미 있는 분리
+    if not re.search(r"[가-힣]", rest):
+        return "", None, text
+    return inner, eq_num, rest
+
+
+def _check_brace_balance(text: str) -> bool:
+    """LaTeX 텍스트에서 { } 균형 여부를 반환한다 (\\{ \\} 는 제외)."""
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text) and text[i + 1] in ("{", "}", "\\"):
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0
+
+
+def _is_pure_eq_paragraph(text: str) -> bool:
+    """
+    paragraph 블록이 display equation으로 승격돼야 하는지 판별한다.
+    조건: 한국어 없음 + 전체 텍스트가 $...$ 하나로 구성 (뒤에 수식번호 허용)
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if re.search(r"[가-힣]", stripped):
+        return False
+    # $...$ 하나로 시작해서 끝나는 패턴 (뒤에 선택적으로 ,.(N) 허용)
+    return bool(re.match(r"^\$[^$].+\$[,.\s]*(?:\(\d+\))?\s*$", stripped, re.DOTALL))
+
+
 def _filter_format_equation(text: str) -> str:
     """수식 블록을 LaTeX equation / align 환경으로 포맷한다."""
     stripped = text.strip()
@@ -233,7 +310,11 @@ def _filter_format_equation(text: str) -> str:
         env = m_inner.group(1)
         end_tag = f"\\end{{{env}}}"
         if end_tag in stripped:
-            return f"\\begin{{equation}}\n{stripped}\n\\end{{equation}}"
+            result = f"\\begin{{equation}}\n{stripped}\n\\end{{equation}}"
+            if not _check_brace_balance(result):
+                print(f"[composer] equation {{ 불균형(inner env), 블록 생략: {text[:60]!r}", file=sys.stderr)
+                return "% [수식 생략: LaTeX 중괄호 불균형]\n"
+            return result
         # \end{...} 없으면 환경 태그 제거 후 일반 equation으로 처리
         stripped = _INNER_ENV.sub("", stripped).strip()
 
@@ -289,6 +370,11 @@ def _filter_format_equation(text: str) -> str:
     if prose_lines:
         prose = _escape_latex_text(" ".join(prose_lines))
         result += "\n\n" + prose
+
+    # { } 균형 체크 — 불균형이면 컴파일 중단 방지를 위해 블록 생략
+    if not _check_brace_balance(result):
+        print(f"[composer] equation {{ 불균형, 블록 생략: {text[:60]!r}", file=sys.stderr)
+        return "% [수식 생략: LaTeX 중괄호 불균형]\n"
 
     return result
 

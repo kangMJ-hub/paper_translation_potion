@@ -286,8 +286,8 @@ _BARE_LATEX_CMDS = re.compile(
 )
 
 _BARE_SUBSUP = re.compile(
-    r"(\\[a-zA-Z]+(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+"  # \cmd_{...}^{...}
-    r"|\w+(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+)"           # word_{...}^{...}
+    r"(\\[a-zA-Z]+\w*(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+"  # \cmd\w*_{...}^{...}  (예: \sim10^{3-4})
+    r"|\w+(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+)"              # word_{...}^{...}
 )
 
 # \frac{...}{...}, \sqrt{...} 등 인자형 bare 명령어 패턴 (\begin, \end 제외)
@@ -306,8 +306,19 @@ def wrap_bare_latex_in_text(text: str) -> str:
     _MATH_SPLIT = re.compile(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)")
 
     def _process_plain(plain: str) -> str:
+        # 0) 연속 LaTeX 명령어(\Gamma\sim\delta 등) → $...$로 감싸기
+        #    (?<!\w) lookbehind가 실패하는 패턴 선처리
+        plain = re.sub(r'(?:\\[a-zA-Z]+){2,}', lambda m: f'${m.group(0)}$', plain)
         # 1) 인자형 명령어(\frac{}{}, \sqrt{} 등) 먼저 감싸기 (내부 구조 보존)
-        plain = _BARE_CMD_ARGS.sub(r"$\1$", plain)
+        # step 0로 생긴 $...$ 보호
+        subparts = _MATH_SPLIT.split(plain)
+        out = []
+        for j, sp in enumerate(subparts):
+            if j % 2 == 1:
+                out.append(sp)
+            else:
+                out.append(_BARE_CMD_ARGS.sub(r"$\1$", sp))
+        plain = "".join(out)
         # 2) 새로 생긴 $...$ 보호 후 subscript/superscript 감싸기
         subparts = _MATH_SPLIT.split(plain)
         out = []

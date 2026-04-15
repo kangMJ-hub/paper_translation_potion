@@ -387,7 +387,8 @@ def _classify_paragraph(text: str, position: int) -> str:
     # 인라인 참조("Figure 1 shows...") 는 제외
     if re.match(r"^(Fig\.|Figure|FIG\.)\s*(\d+|[IVX]+)\s*[.:]", stripped, re.IGNORECASE):
         return "figure_caption"
-    if re.match(r"^(Table|TABLE)\s*(\d+|[IVX]+)\s*[.:]", stripped, re.IGNORECASE):
+    # TABLE N (콜론/마침표 선택적 — "TABLE 1" 단독 레이블도 포함)
+    if re.match(r"^(Table|TABLE)\s+(\d+|[IVX]+)\s*(?:[.:]|$)", stripped, re.IGNORECASE):
         return "table_caption"
 
     # ── 참고문헌 ────────────────────────────────────────────────────────
@@ -396,6 +397,13 @@ def _classify_paragraph(text: str, position: int) -> str:
     # "1) Author..." / "1. Author..." 형식 참고문헌 (position > 20 : 너무 앞은 제외)
     if re.match(r"^\d{1,2}[)\.]\s*[A-Z]", stripped) and position > 20:
         return "reference"
+
+    # ── 각주 ─────────────────────────────────────────────────────────────
+    # "5 URL...", "6 Shown as...", "7 For the B band..." 형태의 각주
+    if (re.match(r"^\d{1,2}\s+[A-Z]", stripped)
+            and position > 5
+            and len(stripped) > 20):
+        return "footnote"
 
     # ── Abstract ────────────────────────────────────────────────────────
     if re.match(r"^abstract", stripped, re.IGNORECASE):
@@ -467,7 +475,11 @@ def _reclassify_ref_section(blocks: list[dict]) -> list[dict]:
             in_ref_section = True
             # 헤딩 자체는 제거
             continue
-        if in_ref_section and b["type"] == "paragraph":
+        if b["type"] == "table_caption" and in_ref_section:
+            # 참고문헌 섹션 내 표 캡션 → 참고문헌 모드 해제 후 그대로 보존
+            in_ref_section = False
+            result.append(b)
+        elif in_ref_section and b["type"] == "paragraph":
             result.append({**b, "type": "reference"})
         else:
             result.append(b)
@@ -1332,18 +1344,20 @@ def _detect_layout(pdf_path: str) -> str:
     try:
         with fitz.open(pdf_path) as doc:
             votes: list[str] = []
-            for page_idx in range(min(2, doc.page_count)):
+            for page_idx in range(min(3, doc.page_count)):
                 page = doc[page_idx]
                 pw = page.rect.width
                 ph = page.rect.height
                 blocks = page.get_text("blocks")  # (x0,y0,x1,y1,text,block_no,block_type)
 
                 # 헤더/푸터 제외: y 중심이 페이지 20~80% 사이 블록만
+                # 전체폭 블록(제목/초록 등, 폭 > 페이지폭 * 0.70) 제외
                 sampled = [
                     b for b in blocks
                     if (b[1] + b[3]) / 2 > ph * 0.20
                     and (b[1] + b[3]) / 2 < ph * 0.80
                     and len(b[4].strip()) > 10  # 매우 짧은 단편 제외
+                    and (b[2] - b[0]) <= pw * 0.70  # 전체폭 블록 제외
                 ]
 
                 if len(sampled) < 5:

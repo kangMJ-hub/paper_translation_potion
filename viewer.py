@@ -177,7 +177,10 @@ def find_pairs():
     # 2) output 루트에 바로 있는 번역본 (legacy)
     for t in sorted(OUTPUT_DIR.glob("*_번역.pdf")):
         orig_name = t.stem.replace("_번역", "") + ".pdf"
-        orig = BASE_DIR / "test_paper" / orig_name
+        # output/ 에 복사된 원본 우선, 없으면 test_paper/ 탐색
+        orig = OUTPUT_DIR / orig_name
+        if not orig.exists():
+            orig = BASE_DIR / "test_paper" / orig_name
         pairs.append({
             "label": f"[output] {t.stem.replace('_번역','')}",
             "orig":  str(orig.relative_to(BASE_DIR)).replace("\\", "/") if orig.exists() else None,

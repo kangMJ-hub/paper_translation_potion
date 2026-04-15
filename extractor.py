@@ -447,6 +447,7 @@ def _postprocess(blocks: list[dict], pdf_path: str = "") -> list[dict]:
     blocks = _reclassify_ref_section(blocks)
     blocks = _merge_leading_fragments(blocks)
     blocks = _relocate_orphaned_paragraphs(blocks)
+    blocks = _sort_figure_captions_by_number(blocks)
     if pdf_path:
         blocks = _fix_references_fallback(blocks, pdf_path)
     return blocks
@@ -584,13 +585,37 @@ def _relocate_orphaned_paragraphs(blocks: list[dict]) -> list[dict]:
     return result
 
 
+def _sort_figure_captions_by_number(blocks: list[dict]) -> list[dict]:
+    """
+    figure_caption 블록을 그림 번호 오름차순으로 재정렬한다.
+
+    2단 조판 논문에서 DocAI가 캡션을 컬럼 순서로 읽어
+    Fig.7이 Fig.5보다 먼저 오는 경우를 교정한다.
+    각 캡션이 차지하던 위치(슬롯)는 그대로 유지하고
+    내용만 번호 순으로 교체한다.
+    """
+    cap_indices = [i for i, b in enumerate(blocks) if b["type"] == "figure_caption"]
+    if len(cap_indices) <= 1:
+        return blocks
+
+    def _fig_num(b: dict) -> int:
+        m = re.search(r"(\d+)", b.get("text", ""))
+        return int(m.group(1)) if m else 9999
+
+    caps_sorted = sorted((blocks[i] for i in cap_indices), key=_fig_num)
+    result = list(blocks)
+    for idx, cap in zip(cap_indices, caps_sorted):
+        result[idx] = cap
+    return result
+
+
 def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
     """
-    DocAI가 참고문헌 번호와 내용을 분리 저장한 경우 병합한다.
+    DocAI가 참고문헌을 불완전하게 추출한 경우 PyMuPDF 결과로 교체한다.
 
-    전략 1: DocAI 블록 내에서 번호만 있는 ref([2] 등)와
-            번호 없는 content ref를 순서대로 짝지어 병합.
-    전략 2: DocAI ref가 부족하면 PyMuPDF 결과로 교체.
+    트리거 조건:
+    - 번호만 있는 ref([2] 등 내용 없음)가 하나라도 존재하는 경우
+    - PyMuPDF ref 수가 DocAI 완전 ref 수보다 많은 경우
     """
     all_refs = [b for b in blocks if b["type"] == "reference"]
     non_refs = [b for b in blocks if b["type"] != "reference"]
@@ -598,41 +623,11 @@ def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
     if not all_refs:
         return blocks
 
-    # ── 전략 1: 번호만 있는 블록 + 내용만 있는 블록 짝짓기 ────────────────
+    # DocAI 분석: 완전한 ref vs 번호만 있는 ref
     num_only = [b for b in all_refs if re.match(r"^\[\d+\]\s*$", b["text"].strip())]
-    content_only = [b for b in all_refs if not re.match(r"^\[\d+\]", b["text"].strip())]
+    complete_docai = [b for b in all_refs if re.match(r"^\[\d+\].+", b["text"].strip())]
 
-    if num_only and content_only:
-        # 번호 있는 완전한 ref (건드리지 않음)
-        complete_refs = [
-            b for b in all_refs
-            if re.match(r"^\[\d+\].+", b["text"].strip())
-        ]
-        merged: list[dict] = list(complete_refs)
-        for num_b, cont_b in zip(num_only, content_only):
-            merged.append({
-                **num_b,
-                "text": num_b["text"].strip() + " " + cont_b["text"].strip(),
-            })
-        # 짝이 남은 번호 블록 (내용 없음) 유지
-        for b in num_only[len(content_only):]:
-            merged.append(b)
-        def _ref_num(b: dict) -> int:
-            mm = re.match(r"^\[(\d+)\]", b["text"].strip())
-            return int(mm.group(1)) if mm else 9999
-        merged.sort(key=_ref_num)
-        print(
-            f"[extractor] 참고문헌 번호-내용 병합: {len(num_only)}개 번호 + "
-            f"{len(content_only)}개 내용 → {len(merged)}개",
-            flush=True,
-        )
-        return non_refs + merged
-
-    # ── 전략 2: PyMuPDF 결과가 더 많으면 교체 ────────────────────────────
-    docai_numbered = [
-        b for b in all_refs
-        if re.match(r"^\[\d+\]", b["text"].strip())
-    ]
+    # PyMuPDF로 내용이 있는 ref만 수집 (번호만 있는 항목은 제외)
     mupdf_refs: list[str] = []
     try:
         with fitz.open(pdf_path) as doc:
@@ -640,12 +635,14 @@ def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
                 page = doc[page_idx]
                 for mb in page.get_text("blocks"):
                     text = mb[4].strip()
-                    if re.search(r"^\[\d+\]", text):
+                    if re.match(r"^\[\d+\]", text):
                         parts = re.split(r"(?=\[\d+\])", text)
                         for part in parts:
                             part = part.strip()
-                            if part and re.match(r"^\[\d+\]", part):
+                            # 내용이 있는 ref만 수집 (번호만 있는 것은 제외)
+                            if part and re.match(r"^\[\d+\].+", part):
                                 mupdf_refs.append(part)
+        # 중복 제거 + 번호 기준 정렬
         seen_nums: set[int] = set()
         deduped: list[str] = []
         for r in mupdf_refs:
@@ -660,7 +657,12 @@ def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
         print(f"[extractor] 참고문헌 fallback 실패: {e}", file=sys.stderr)
         return blocks
 
-    if len(mupdf_refs) <= len(docai_numbered):
+    # 번호만 있는 ref가 있거나 PyMuPDF가 더 많으면 교체
+    has_broken = bool(num_only)
+    if not has_broken and len(mupdf_refs) <= len(complete_docai):
+        return blocks
+
+    if not mupdf_refs:
         return blocks
 
     ref_page = next((b["page"] for b in all_refs), 1)
@@ -675,7 +677,7 @@ def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
         for i, ref_text in enumerate(mupdf_refs)
     ]
     print(
-        f"[extractor] 참고문헌 fallback: DocAI {len(docai_numbered)}개 → "
+        f"[extractor] 참고문헌 교체: DocAI {len(all_refs)}개(완전 {len(complete_docai)}개) → "
         f"PyMuPDF {len(mupdf_refs)}개",
         flush=True,
     )

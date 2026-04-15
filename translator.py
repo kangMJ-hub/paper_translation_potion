@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-from utils import protect_equations, restore_equations, fix_gemini_latex, apply_term_dict
+from utils import fix_gemini_latex, apply_term_dict, protect_equations, restore_equations
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +87,18 @@ def translate(paper: dict, config: dict) -> dict:
                     result = _normalize_equation(block, eq_model, config)
                 else:
                     result = _translate_block(block, model, config)
-                with cache_lock:
-                    cache[block_id] = result
-                    _save_cache(cache, cache_file)
+                # 번역 실패 캐시 오염 방지:
+                # paragraph 계열 블록에서 결과가 원문과 동일하고 한국어가 없으면
+                # 캐시에 저장하지 않아 다음 실행 시 재시도하게 한다.
+                is_failed = (
+                    btype not in _EQUATION_TYPES
+                    and result == block["text"]
+                    and not re.search(r"[가-힣]", result)
+                )
+                if not is_failed:
+                    with cache_lock:
+                        cache[block_id] = result
+                        _save_cache(cache, cache_file)
                 translated_block["translated_text"] = result
 
         results[i] = translated_block
@@ -151,29 +160,30 @@ def _normalize_equation(block: dict, model: GenerativeModel, config: dict) -> st
 def _translate_block(block: dict, model: GenerativeModel, config: dict) -> str:
     """
     단일 블록을 번역한다.
-    1. protect_equations() 로 수식 보호
+    1. protect_equations()로 수식을 플레이스홀더로 치환
     2. Vertex AI API 호출 (system_instruction은 model에 이미 설정됨)
-    3. restore_equations() 로 수식 복원
-    4. 환각 감지 (길이 3배 초과 OR 플레이스홀더 소실) → 재시도
-    5. 최종 실패 시 원문 반환
+    3. restore_equations()로 플레이스홀더를 원래 수식으로 복원
+    4. 환각 감지 (길이 3배 초과) → 재시도
+    5. fix_gemini_latex(), apply_term_dict() 적용
+    6. 최종 실패 시 원문 반환
     """
     text = block["text"]
     max_retries = config.get("max_retries", 3)
     hallucination_ratio = config.get("hallucination_ratio", 3.0)
 
-    protected, mapping = protect_equations(text)
-    original_eq_count = protected.count("__EQ")
+    protected, eq_map = protect_equations(text)
 
     for attempt in range(max_retries):
         try:
             response = model.generate_content(f"번역할 텍스트:\n{protected}")
             translated = response.text.strip()
+            translated = restore_equations(translated, eq_map)
 
-            # 환각 감지 1: 길이 3배 초과
-            if len(protected) > 50 and len(translated) > len(protected) * hallucination_ratio:
+            # 환각 감지: 길이 3배 초과
+            if len(text) > 50 and len(translated) > len(text) * hallucination_ratio:
                 print(
                     f"\n[translator] 경고: 환각 의심 "
-                    f"({len(translated)/len(protected):.1f}배), "
+                    f"({len(translated)/len(text):.1f}배), "
                     f"재시도 ({attempt+1}/{max_retries})",
                     file=sys.stderr,
                 )
@@ -182,22 +192,7 @@ def _translate_block(block: dict, model: GenerativeModel, config: dict) -> str:
                 print("[translator] 환각 의심 번역 폐기, 원문 반환", file=sys.stderr)
                 return text
 
-            # 환각 감지 2: 플레이스홀더 소실
-            translated_eq_count = translated.count("__EQ")
-            if original_eq_count > 0 and translated_eq_count != original_eq_count:
-                print(
-                    f"\n[translator] 경고: 수식 플레이스홀더 소실 "
-                    f"(원문 {original_eq_count}개 → 번역 {translated_eq_count}개), "
-                    f"재시도 ({attempt+1}/{max_retries})",
-                    file=sys.stderr,
-                )
-                if attempt < max_retries - 1:
-                    continue
-                print("[translator] 플레이스홀더 소실, 원문 반환", file=sys.stderr)
-                return text
-
-            result = restore_equations(translated, mapping)
-            result = fix_gemini_latex(result)
+            result = fix_gemini_latex(translated)
             result = apply_term_dict(result)
             return result
 
@@ -237,12 +232,14 @@ def _build_system_prompt(style: str) -> str:
         "당신은 영어 물리학 논문을 한국어로 번역하는 전문 번역가입니다.\n"
         f"번역 스타일: {style}\n"
         "번역 규칙:\n"
-        "- 수식은 번역하지 않고 __EQ0__ 형태의 플레이스홀더를 그대로 유지한다.\n"
+        "- $...$, $$...$$, \\begin{equation}...\\end{equation}, \\begin{align}...\\end{align} 등\n"
+        "  LaTeX 수식 환경 안의 내용은 절대 번역하거나 수정하지 않는다.\n"
+        "- 수식 기호(\\alpha, \\sigma, \\frac 등 백슬래시로 시작하는 LaTeX 명령어)도 그대로 유지한다.\n"
         "- 물리학 전문 용어는 한국어로 번역하되, 혼동 우려가 있으면 영어 병기한다.\n"
         "- 저자명, 기관명, 고유명사는 번역하지 않는다.\n"
         "- 그림 캡션은 번역하고, Figure는 '그림'으로 표기한다.\n"
         "- 참고문헌은 원문 그대로 유지한다.\n"
-        "- 학술적 문체와 합니다체를 유지한다.\n"
+        "- 학술적 문체와 한다체를 유지한다.\n"
         "【절대 금지】원문에 없는 내용을 추가하거나 다른 논문 내용을 삽입하지 않는다.\n"
         "번역 결과 텍스트만 출력하고, 설명이나 주석은 추가하지 않는다."
     )
@@ -261,6 +258,19 @@ def _init_vertex(config: dict) -> None:
             "config.yaml에 project_id가 설정되지 않았습니다.\n"
             "config.yaml의 project_id를 GCP 프로젝트 ID로 설정하세요."
         )
+    # 한국어 Windows에서 gcloud가 CP949로 출력해 UnicodeDecodeError 발생 방지.
+    # generate_content() 첫 호출 시 lazy credential 로딩에도 적용되어야 하므로
+    # 패치를 세션 전체에 유지 (finally로 원복하지 않음). 중복 패치 방지.
+    import google.auth._cloud_sdk as _cs
+    if not getattr(_cs, "_cp949_patched", False):
+        _orig = _cs.get_project_id
+        def _safe(_orig=_orig, _pid=project_id):
+            try:
+                return _orig()
+            except UnicodeDecodeError:
+                return _pid
+        _cs.get_project_id = _safe
+        _cs._cp949_patched = True
     vertexai.init(project=project_id, location=location)
 
 

@@ -10,7 +10,7 @@ import sys
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from utils import escape_latex, fix_gemini_latex, unicode_math_to_inline_latex
+from utils import escape_latex, fix_gemini_latex, unicode_math_to_inline_latex, wrap_bare_latex_in_text, protect_equations, restore_equations
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +22,11 @@ def compose(translated: dict, config: dict) -> str:
     translated.json dict를 받아 .tex를 생성하고 XeLaTeX으로 컴파일한다.
     반환: 생성된 PDF 경로
     """
+    # metadata.layout이 있으면 config의 layout 값을 덮어씀 (입력 논문 레이아웃 자동 반영)
+    layout = translated.get("metadata", {}).get("layout", config.get("layout", "onecolumn"))
+    config = dict(config)
+    config["layout"] = layout
+
     tex_content = _render_template(translated, config)
 
     errors = _validate_latex(tex_content)
@@ -80,6 +85,12 @@ def _render_template(translated: dict, config: dict) -> str:
     env.filters["format_figure"] = _filter_format_figure
     env.filters["escape_latex"] = escape_latex
     env.filters["escape_latex_text"] = _escape_latex_text
+    env.filters["split_refs"] = _filter_split_refs
+    env.filters["format_table"] = _filter_format_table
+    env.filters["basename"] = os.path.basename
+    env.filters["ref_num"] = _filter_ref_num
+    env.filters["strip_ref_num"] = _filter_strip_ref_num
+    env.filters["has_ref_num"] = lambda e: bool(re.match(r"^\[\d+\]|^\d{1,2}\)", e.strip()))
 
     template = env.get_template(template_name)
 
@@ -108,11 +119,81 @@ def _render_template(translated: dict, config: dict) -> str:
         metadata = dict(metadata)
         metadata.setdefault("translated_title", metadata.get("title", ""))
 
-    body_blocks = [
+    _ref_heading = re.compile(r"^(references|참고문헌|bibliography)$", re.IGNORECASE)
+
+    # translated.json 캐시가 구 버전일 때를 대비해 여기서도 재분류 적용
+    # 1) References 섹션 헤딩 이후 paragraph → reference
+    # 2) 헤딩 없으면 citation 패턴 paragraph → reference
+    _citation_pat = re.compile(
+        r"^(?:\d{1,2}\])?"           # 잘린 번호 (예: "19]")
+        r"\s*[A-Z][a-zA-Z\-]+\s+"   # 성(Last name)
+        r"[A-Z]{1,3}\s+"             # 이니셜
+        r"\d{4}\b",                  # 연도
+    )
+    reclassified: list[dict] = []
+    in_ref_sec = False
+    for b in blocks:
+        if (b["type"] in ("section", "subsection", "paragraph")
+                and _ref_heading.match(b.get("text", "").strip())):
+            in_ref_sec = True
+            continue
+        if b["type"] == "paragraph":
+            text = b.get("text", "").strip()
+            is_citation = (
+                in_ref_sec
+                or _citation_pat.match(text)
+                or re.match(r"^\d{1,2}\]\s*[A-Z]", text)  # "19] Welton..."
+            )
+            if is_citation:
+                reclassified.append({**b, "type": "reference"})
+                continue
+        reclassified.append(b)
+    blocks = reclassified
+
+    raw_body = [
         b for b in blocks
         if b["type"] not in ("title", "authors", "abstract", "reference")
+        and not (b["type"] in ("section", "subsection") and _ref_heading.match(b.get("text", "").strip()))
     ]
-    reference_blocks = [b for b in blocks if b["type"] == "reference"]
+    # table_caption + table_data 쌍을 하나의 'table' 블록으로 합침
+    body_blocks = []
+    i = 0
+    while i < len(raw_body):
+        b = raw_body[i]
+        if (b["type"] == "table_caption"
+                and i + 1 < len(raw_body)
+                and raw_body[i + 1]["type"] == "table_data"):
+            data_block = raw_body[i + 1]
+            data_text = (data_block.get("translated_text")
+                         or data_block.get("text", ""))
+            merged = dict(b)
+            merged["type"] = "table"
+            merged["data_text"] = data_text
+            # translated.json에는 rows가 없으므로 data_text 줄 분리로 재구성
+            if not merged.get("rows"):
+                lines = [ln for ln in data_text.splitlines() if ln.strip()]
+                if lines:
+                    merged["rows"] = [[ln] for ln in lines]
+            body_blocks.append(merged)
+            i += 2
+        elif b["type"] == "table_caption" and b.get("table_img_path"):
+            # YOLO로 크롭된 표 이미지가 있으면 table 블록으로 승격
+            merged = dict(b)
+            merged["type"] = "table"
+            body_blocks.append(merged)
+            i += 1
+        else:
+            body_blocks.append(b)
+            i += 1
+    def _ref_sort_key(b):
+        m = re.match(r"^\[(\d+)\]|^(\d+)[).]", b.get("text", "").strip())
+        if m:
+            return int(m.group(1) or m.group(2))
+        return 9999
+    reference_blocks = sorted(
+        [b for b in blocks if b["type"] == "reference"],
+        key=_ref_sort_key,
+    )
 
     # figure index → path 매핑 (figure_caption 블록의 figure_path 우선 사용)
     fig_path_map: dict[int, str] = {}
@@ -142,9 +223,19 @@ def _filter_format_equation(text: str) -> str:
     if not stripped:
         return ""
 
-    # 이미 환경으로 감싸진 경우 그대로
+    # 이미 equation/$$로 감싸진 경우 그대로
     if stripped.startswith(r"\begin{equation}") or stripped.startswith("$$"):
         return stripped
+    # aligned/align/gather 환경은 equation으로 감싸야 math mode가 됨
+    _INNER_ENV = re.compile(r"^\\begin\{(aligned|align\*?|gather\*?|multline\*?)\}")
+    m_inner = _INNER_ENV.match(stripped)
+    if m_inner:
+        env = m_inner.group(1)
+        end_tag = f"\\end{{{env}}}"
+        if end_tag in stripped:
+            return f"\\begin{{equation}}\n{stripped}\n\\end{{equation}}"
+        # \end{...} 없으면 환경 태그 제거 후 일반 equation으로 처리
+        stripped = _INNER_ENV.sub("", stripped).strip()
 
     # 합자 복원
     stripped = stripped.replace("ﬁ", "fi").replace("ﬂ", "fl")
@@ -171,6 +262,18 @@ def _filter_format_equation(text: str) -> str:
                 prose_lines.append(ls)
 
     eq_text = "\n".join(eq_lines).strip()
+    # 번역기가 수식 텍스트에 $...$ 또는 $$...$$ 를 남긴 경우 제거
+    eq_text = re.sub(r"^\$\$(.+?)\$\$$", r"\1", eq_text, flags=re.DOTALL)
+    eq_text = re.sub(r"^\$(.+?)\$$", r"\1", eq_text, flags=re.DOTALL)
+    eq_text = eq_text.strip()
+
+    # 측정값처럼 생긴 경우 (등호 없음, 숫자로 시작) → 인라인 텍스트로 처리
+    # 예: "87\text{ nm} \pm 1.4\text{ nm} 3\sigma" 같은 그림 데이터 누출
+    if (re.match(r"^\d", eq_text)
+            and not re.search(r"[=≡≈∝]|\\approx|\\equiv|\\propto", eq_text)
+            and "\n" not in eq_text.strip()):
+        return _escape_latex_text(eq_text)
+
     eq_raw_lines = [l for l in eq_text.split("\n") if l.strip()]
     numbered = re.findall(r",?\s*\((\d+)\)\s*$", eq_text, re.MULTILINE)
 
@@ -190,6 +293,68 @@ def _filter_format_equation(text: str) -> str:
     return result
 
 
+def _filter_format_table(block: dict) -> str:
+    """rows 데이터를 LaTeX tabular 환경으로 렌더링한다."""
+    rows = block.get("rows", [])
+    if not rows:
+        return ""
+
+    # 빈 셀 None → 빈 문자열, 열 수 통일
+    cleaned = []
+    max_cols = max((len(r) for r in rows), default=0)
+    for row in rows:
+        cells = [(c or "") for c in row]
+        while len(cells) < max_cols:
+            cells.append("")
+        cleaned.append(cells)
+
+    # 단일 컬럼(줄 분리 fallback)이면 넓은 p{} 컬럼 사용
+    if max_cols == 1:
+        col_spec = "p{0.85\\columnwidth}"
+    else:
+        col_spec = "c" * max_cols
+    lines = [f"\\begin{{tabular}}{{{col_spec}}}", "\\hline"]
+    for i, row in enumerate(cleaned):
+        escaped = [_escape_latex_text(str(c)) for c in row]
+        lines.append(" & ".join(escaped) + " \\\\")
+        if i == 0:  # 헤더 행 아래 구분선
+            lines.append("\\hline")
+    lines.append("\\hline")
+    lines.append("\\end{tabular}")
+    return "\n".join(lines)
+
+
+def _filter_strip_ref_num(entry: str) -> str:
+    """참고문헌 항목에서 앞의 [N] 또는 N) 번호 접두사를 제거한다."""
+    s = re.sub(r"^\[\d+\]\s*", "", entry.strip())
+    s = re.sub(r"^\d+\)\s*", "", s)
+    return s
+
+
+def _filter_ref_num(entry: str) -> str:
+    """참고문헌 항목에서 원본 번호를 추출한다. [11] → 11, 11) → 11, 없으면 순번 해시."""
+    m = re.match(r"^\[(\d+)\]", entry.strip())
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d+)\)", entry.strip())
+    if m:
+        return m.group(1)
+    return str(abs(hash(entry[:20])) % 10000)
+
+
+def _filter_split_refs(text: str) -> list[str]:
+    """레퍼런스 텍스트를 [N] 또는 N) 단위로 분리한다.
+    번호 없는 블록은 그대로 1개 항목으로 반환한다."""
+    if re.search(r"\[\d+\]", text):
+        parts = re.split(r"(?=\[\d+\])", text.strip())
+    elif re.search(r"(?<!\w)\d{1,2}\)\s*[A-Z]", text):
+        parts = re.split(r"(?=(?<!\w)\d{1,2}\)\s*[A-Z])", text.strip())
+    else:
+        # 번호 없는 단일 항목 → 그대로 반환
+        parts = [text.strip()]
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _filter_format_figure(block: dict) -> str:
     """figure_caption 블록을 LaTeX figure 환경으로 포맷한다."""
     fig_num = block.get("figure_index", 0)
@@ -204,7 +369,10 @@ def _filter_format_figure(block: dict) -> str:
 
     if fig_path and os.path.exists(fig_path):
         rel_path = "figures/" + os.path.basename(fig_path)
-        image_content = f"  \\includegraphics[width=0.9\\columnwidth]{{{rel_path}}}"
+        image_content = (
+            f"  \\adjustbox{{max totalsize={{\\columnwidth}}{{0.35\\textheight}}}}"
+            f"{{\\includegraphics{{{rel_path}}}}}"
+        )
     else:
         image_content = (
             "  \\fbox{\\parbox{0.9\\columnwidth}{\\centering "
@@ -212,7 +380,7 @@ def _filter_format_figure(block: dict) -> str:
         )
 
     return (
-        "\\begin{figure}[htbp]\n"
+        "\\begin{figure}[H]\n"
         "\\centering\n"
         f"{image_content}\n"
         f"  \\caption{{{escaped_caption}}}\n"
@@ -227,9 +395,23 @@ def _filter_format_figure(block: dict) -> str:
 
 def _escape_latex_text(text: str) -> str:
     """인라인/디스플레이 수식을 보존하면서 LaTeX 특수문자를 이스케이프한다."""
+    # HTML 태그 → LaTeX 변환 (Gemini가 출력한 <sup>, <sub> 등)
+    text = re.sub(r"<sup>(.*?)</sup>", r"$^{\1}$", text)
+    text = re.sub(r"<sub>(.*?)</sub>", r"$_{\1}$", text)
+    text = re.sub(r"<[^>]+>", "", text)  # 나머지 HTML 태그 제거
     # PDF 추출 합자(ligature) → 일반 문자로 변환
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl")
                 .replace("ﬀ", "ff").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
+    # fix_gemini_latex: bare LaTeX 줄 전체를 $...$ 로 감싸기 (수식 없는 줄에만 적용)
+    text = fix_gemini_latex(text)
+    # 단락 내 stray 환경 태그 제거 (Gemini가 수식 환경 태그를 단락에 삽입한 경우)
+    text = re.sub(r'\\end\{[^}]+\}', '', text)
+    text = re.sub(r'\\begin\{(aligned|align\*?|gather\*?|multline\*?)\}', '', text)
+    # \\ (N) 수식 줄바꿈+번호 패턴 → 번호만 남기기
+    text = re.sub(r'\\\\\s*\((\d+)\)', r' (\1)', text)
+    text = re.sub(r'\\\\(?=\s|$)', ' ', text)
+    # bare LaTeX 명령어 / subscript/superscript → $...$ 감싸기 (이스케이프 전에 처리)
+    text = wrap_bare_latex_in_text(text)
     # 1단계: 기존 $...$ 수식 분리 → 수식 부분은 건드리지 않음
     parts = re.split(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)", text)
     result = []
@@ -278,6 +460,14 @@ def _compile(tex_path: str, config: dict) -> tuple[bool, str]:
             return False, "XeLaTeX 컴파일 타임아웃 (120초 초과)"
 
         if proc.returncode != 0:
+            # PDF가 생성됐으면 경고만 내고 계속 진행 (bbl 없음 등 경미한 오류)
+            pdf_path = os.path.splitext(tex_path)[0] + ".pdf"
+            if os.path.exists(pdf_path):
+                print(
+                    f"[composer] XeLaTeX {run}회차: returncode={proc.returncode}이나 PDF 생성됨, 진행",
+                    file=sys.stderr,
+                )
+                continue
             # 오류 메시지에서 핵심 라인만 추출
             error_lines = [
                 line for line in proc.stdout.splitlines()

@@ -73,12 +73,23 @@ def main() -> None:
         if prev_pdf_name and prev_pdf_name != current_pdf_name:
             print(f"[main] 새 논문 감지 ({prev_pdf_name} → {current_pdf_name})")
             print("[main] output 초기화 중...")
-            import importlib.util, sys as _sys
-            clean_path = os.path.join(output_dir, "clean.py")
-            spec = importlib.util.spec_from_file_location("clean", clean_path)
-            clean_mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(clean_mod)
-            clean_mod.clean(output_dir)
+            import glob as _glob, shutil as _shutil
+            # 중간 파일 삭제
+            for f in ["paper.json", "translated.json", "translated_blocks.json"]:
+                p = os.path.join(output_dir, f)
+                if os.path.exists(p):
+                    os.remove(p)
+            # 이전 논문 생성 파일 삭제 (PDF + LaTeX 보조 파일)
+            prev_stem = os.path.splitext(prev_pdf_name)[0]
+            for ext in ("*.pdf", "*.tex", "*.aux", "*.log", "*.out", "*.bib"):
+                for p in _glob.glob(os.path.join(output_dir, f"{prev_stem}*{ext.lstrip('*')}")):
+                    os.remove(p)
+                    print(f"[main] 삭제: {p}")
+            # figures 디렉토리 초기화
+            figures_dir = config.get("figures_dir", os.path.join(output_dir, "figures"))
+            if os.path.isdir(figures_dir):
+                _shutil.rmtree(figures_dir)
+            os.makedirs(figures_dir, exist_ok=True)
 
     # ── 수동 캐시 초기화 (--clear-cache) ──────────────────────────────────
     if args.clear_cache:
@@ -130,6 +141,12 @@ def main() -> None:
     print("[3/3] 조립 중...")
     from composer import compose
     pdf_path = compose(translated, config)
+
+    # 원본 PDF를 output 폴더에 복사 (Gemini 품질 검사용)
+    import shutil as _shutil
+    orig_copy = os.path.join(output_dir, os.path.basename(args.pdf))
+    if os.path.abspath(args.pdf) != os.path.abspath(orig_copy):
+        _shutil.copy2(args.pdf, orig_copy)
 
     print(f"\n완료 → {pdf_path}")
 

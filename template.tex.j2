@@ -10,6 +10,7 @@
 \usepackage{amssymb}
 \usepackage{graphicx}
 \usepackage{float}
+\usepackage{adjustbox}
 \usepackage{hyperref}
 \usepackage{booktabs}
 
@@ -18,6 +19,7 @@
 
 \renewcommand{\figurename}{그림}
 \renewcommand{\tablename}{표}
+\renewcommand{\bibsection}{}
 
 \begin{document}
 
@@ -50,25 +52,39 @@
 
 ((( block | format_figure )))
 
-((*- elif block.type == 'table_caption' *))
+((*- elif block.type == 'table' *))
 
-\begin{table}[htbp]
+\begin{table}[H]
 \centering
 \caption{((( (block.translated_text or block.text) | escape_latex_text )))}
+\vspace{0.5em}
+((*- if block.table_img_path *))
+\includegraphics[width=0.9\columnwidth]{((( 'figures/' + block.table_img_path | basename )))}
+((*- elif block.rows *))
+((( block | format_table )))
+((*- elif block.data_text *))
+\fbox{\parbox{0.9\columnwidth}{\small ((( block.data_text | escape_latex_text )))}}
+((*- endif *))
 \end{table}
-
-((*- elif block.type == 'table_data' *))
-((# 표 데이터는 현재 단순 출력 #))
 
 ((*- endif *))
 
 ((*- endfor *))
 
 ((*- if reference_blocks *))
+\par\vspace{2em}{\Large\textbf{참고문헌}}\par\vspace{0.5em}
 \begin{thebibliography}{99}
+((*- set ns = namespace(ref_counter=0) *))
 ((*- for ref in reference_blocks *))
-\bibitem{} ((( ref.text | escape_latex )))
+((*- for entry in ref.text | split_refs *))
+((*- set ns.ref_counter = ns.ref_counter + 1 *))
+((*- if entry | has_ref_num *))
+\bibitem[((( entry | ref_num )))]{ref((( entry | ref_num )))} ((( entry | strip_ref_num | escape_latex )))
+((*- else *))
+\bibitem{refh((( ns.ref_counter )))} ((( entry | escape_latex )))
+((*- endif *))
 
+((*- endfor *))
 ((*- endfor *))
 \end{thebibliography}
 ((*- endif *))

@@ -7,8 +7,13 @@ project_id: "paper-translator-potion"
 location: "us-central1"
 model: "gemini-2.5-flash"
 
+# Document AI Layout Parser
+# 프로세서 생성: https://console.cloud.google.com/ai/document-ai
+docai_location: "us"          # 프로세서 리전 (us 또는 eu)
+docai_processor_id: "272be2d68ebb4a12"
+
 # 번역 설정
-translation_style: "합니다체"
+translation_style: "한다체"
 max_workers: 5
 max_retries: 3
 hallucination_ratio: 3.0

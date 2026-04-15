@@ -130,6 +130,13 @@ _UNICODE_MATH_MAP: list[tuple[str, str]] = [
     ("⟨", r"\langle"),  ("⟩", r"\rangle"),  ("†", r"\dagger"),  ("‡", r"\ddagger"),
     ("∝", r"\propto"),  ("∈", r"\in"),      ("∉", r"\notin"),   ("⊂", r"\subset"),
     ("∪", r"\cup"),     ("∩", r"\cap"),     ("∧", r"\wedge"),   ("∨", r"\vee"),
+    # 폰트 미지원 문자 (Un Batang 등에서 빈 네모로 표시됨)
+    ("−", r"-"),        ("◦", r"^\circ"),   ("∆", r"\Delta"),
+    # 상첨자/하첨자
+    ("⁰", r"^{0}"), ("¹", r"^{1}"), ("²", r"^{2}"), ("³", r"^{3}"),
+    ("⁴", r"^{4}"), ("⁵", r"^{5}"), ("⁶", r"^{6}"), ("⁷", r"^{7}"),
+    ("⁸", r"^{8}"), ("⁹", r"^{9}"), ("⁻", r"^{-}"), ("⁺", r"^{+}"),
+    ("₀", r"_{0}"), ("₁", r"_{1}"), ("₂", r"_{2}"), ("₃", r"_{3}"),
 ]
 
 
@@ -176,6 +183,9 @@ def escape_latex(text: str) -> str:
     LaTeX 특수문자를 이스케이프한다 (수식 모드 밖 전용).
     백슬래시를 가장 먼저 처리해야 이중 이스케이프가 발생하지 않는다.
     """
+    # PDF 추출 합자(ligature) → 일반 문자로 변환
+    text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl")
+                .replace("ﬀ", "ff").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = text.replace("\\", "\\textbackslash{}")
     text = text.replace("%", "\\%")
     text = text.replace("&", "\\&")
@@ -249,6 +259,8 @@ TERM_DICT: dict[str, str] = {
     "Bloch equations": "블로흐 방정식",
     "Rabi frequency": "라비 주파수",
     "Rabi oscillation": "라비 진동",
+    "narrow pitch": "미세 피치",
+    "narrow-pitch": "미세 피치",
 }
 
 
@@ -257,3 +269,69 @@ def apply_term_dict(text: str) -> str:
     for eng, kor in TERM_DICT.items():
         text = text.replace(eng, kor)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Bare LaTeX 패턴 → $...$ 자동 감싸기
+# ---------------------------------------------------------------------------
+
+_BARE_LATEX_CMDS = re.compile(
+    r"(?<!\w)"
+    r"(\\(?:rightarrow|leftarrow|leftrightarrow|Rightarrow|Leftarrow|"
+    r"to|cdot|times|pm|mp|approx|leq|geq|neq|infty|partial|nabla|"
+    r"alpha|beta|gamma|delta|sigma|omega|mu|nu|lambda|pi|rho|tau|"
+    r"phi|psi|theta|Gamma|Delta|Sigma|Omega|hbar|propto|sim|"
+    r"circ|dagger|ln|exp|sin|cos|tan|log|hat|vec|bar|tilde|dot))"
+    r"(?!\w)"
+)
+
+_BARE_SUBSUP = re.compile(
+    r"(\\[a-zA-Z]+(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+"  # \cmd_{...}^{...}
+    r"|\w+(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})+)"           # word_{...}^{...}
+)
+
+# \frac{...}{...}, \sqrt{...} 등 인자형 bare 명령어 패턴 (\begin, \end 제외)
+_BARE_CMD_ARGS = re.compile(
+    r"(\\(?!begin\b|end\b)[a-zA-Z]+(?:\{(?:[^{}]|\{[^{}]*\})*\}){1,3})"
+)
+
+
+def wrap_bare_latex_in_text(text: str) -> str:
+    """
+    본문 텍스트에서 $...$로 감싸지지 않은 bare LaTeX 수식 패턴을 $...$로 감싼다.
+    - subscript/superscript: word_{...}, word^{...}
+    - 수학 명령어: \\rightarrow, \\pm 등
+    이미 $...$ 안에 있는 내용은 건드리지 않는다.
+    """
+    _MATH_SPLIT = re.compile(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)")
+
+    def _process_plain(plain: str) -> str:
+        # 1) 인자형 명령어(\frac{}{}, \sqrt{} 등) 먼저 감싸기 (내부 구조 보존)
+        plain = _BARE_CMD_ARGS.sub(r"$\1$", plain)
+        # 2) 새로 생긴 $...$ 보호 후 subscript/superscript 감싸기
+        subparts = _MATH_SPLIT.split(plain)
+        out = []
+        for j, sp in enumerate(subparts):
+            if j % 2 == 1:
+                out.append(sp)  # 이미 수식: 그대로
+            else:
+                out.append(_BARE_SUBSUP.sub(r"$\1$", sp))
+        plain = "".join(out)
+        # 3) 새로 생긴 $...$ 보호 후 standalone 명령어 감싸기
+        subparts = _MATH_SPLIT.split(plain)
+        out = []
+        for j, sp in enumerate(subparts):
+            if j % 2 == 1:
+                out.append(sp)  # 이미 수식: 그대로
+            else:
+                out.append(_BARE_LATEX_CMDS.sub(r"$\1$", sp))
+        return "".join(out)
+
+    parts = _MATH_SPLIT.split(text)
+    result = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            result.append(part)  # 기존 수식: 그대로
+        else:
+            result.append(_process_plain(part))
+    return "".join(result)

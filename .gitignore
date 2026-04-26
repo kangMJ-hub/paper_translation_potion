@@ -33,6 +33,9 @@ build/
 *.local.yaml
 *.local.json
 
+# 레거시
+legacy/
+
 # OS 생성 파일
 .DS_Store
 Thumbs.db

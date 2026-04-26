@@ -214,6 +214,16 @@ def _render_template(translated: dict, config: dict) -> str:
         [b for b in blocks if b["type"] == "reference"],
         key=_ref_sort_key,
     )
+    # 참고문헌 스타일 감지: 하나라도 [N] / N) 번호가 있으면 numbered, 없으면 plain
+    _has_num = lambda e: bool(re.match(r"^\[\d+\]|^\d{1,2}\)", e.strip()))
+    ref_style = "plain"
+    for rb in reference_blocks:
+        for entry in _filter_split_refs(rb.get("text", "")):
+            if _has_num(entry):
+                ref_style = "numbered"
+                break
+        if ref_style == "numbered":
+            break
 
     # figure index → path 매핑 (figure_caption 블록의 figure_path 우선 사용)
     fig_path_map: dict[int, str] = {}
@@ -225,6 +235,7 @@ def _render_template(translated: dict, config: dict) -> str:
         abstract_text=abstract_text,
         body_blocks=body_blocks,
         reference_blocks=reference_blocks,
+        ref_style=ref_style,
         fig_path_map=fig_path_map,
         config=config,
         main_font=config.get("main_font", "NanumMyeongjo"),
@@ -346,6 +357,10 @@ def _filter_format_equation(text: str) -> str:
     # 번역기가 수식 텍스트에 $...$ 또는 $$...$$ 를 남긴 경우 제거
     eq_text = re.sub(r"^\$\$(.+?)\$\$$", r"\1", eq_text, flags=re.DOTALL)
     eq_text = re.sub(r"^\$(.+?)\$$", r"\1", eq_text, flags=re.DOTALL)
+    # 수식 번호 앞 중복 괄호 및 뒤 stray $ 제거: "( (19)$" → "(19)"
+    eq_text = re.sub(r'\(\s*(\(\d+[a-z]?\))\s*\$?', r'\1', eq_text)
+    # 줄 끝 stray $ 제거 (수식 환경 내부)
+    eq_text = re.sub(r'\$\s*$', '', eq_text, flags=re.MULTILINE)
     eq_text = eq_text.strip()
 
     # 측정값처럼 생긴 경우 (등호 없음, 숫자로 시작) → 인라인 텍스트로 처리
@@ -488,6 +503,33 @@ def _escape_latex_text(text: str) -> str:
     # PDF 추출 합자(ligature) → 일반 문자로 변환
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl")
                 .replace("ﬀ", "ff").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
+
+    # math 환경 보호: \begin{matrix}...\end{matrix} 등이 escape_latex를 통과하지 않도록
+    # placeholder는 LaTeX 특수문자를 포함하지 않으므로 escape_latex에 안전
+    _MATH_ENV_RE = re.compile(
+        r'\\begin\{(matrix|pmatrix|bmatrix|vmatrix|Vmatrix|array|cases|split|'
+        r'aligned|alignat\*?|gathered|smallmatrix)\}'
+        r'.*?'
+        r'\\end\{\1\}',
+        re.DOTALL,
+    )
+    # matrix/cases 등은 텍스트 모드에서 직접 사용 불가 → \[ \]로 감싸야 함
+    _NEEDS_DISPLAY_WRAP = {'matrix', 'pmatrix', 'bmatrix', 'vmatrix', 'Vmatrix',
+                           'array', 'cases', 'smallmatrix'}
+    _env_store: dict[str, str] = {}
+    _env_ctr = [0]
+    def _save_env(m: re.Match) -> str:
+        k = f"MATHENVPROTECT{_env_ctr[0]}END"
+        env_name = m.group(1).rstrip('*')
+        content = m.group(0)
+        if env_name in _NEEDS_DISPLAY_WRAP:
+            _env_store[k] = f'\\[\n{content}\n\\]'
+        else:
+            _env_store[k] = content
+        _env_ctr[0] += 1
+        return k
+    text = _MATH_ENV_RE.sub(_save_env, text)
+
     # fix_gemini_latex: bare LaTeX 줄 전체를 $...$ 로 감싸기 (수식 없는 줄에만 적용)
     text = fix_gemini_latex(text)
     # 단락 내 stray 환경 태그 제거 (Gemini가 수식 환경 태그를 단락에 삽입한 경우)
@@ -496,25 +538,35 @@ def _escape_latex_text(text: str) -> str:
     # \\ (N) 수식 줄바꿈+번호 패턴 → 번호만 남기기
     text = re.sub(r'\\\\\s*\((\d+)\)', r' (\1)', text)
     text = re.sub(r'\\\\(?=\s|$)', ' ', text)
+    # $word \cmd...$ 패턴: 수식 앞 일반 영어 단어를 수식 밖으로 이동
+    # 예: "$reduced \chi^{2}$" → "reduced $\chi^{2}$"
+    text = re.sub(r'\$([a-z]+(?:\s+[a-z]+)*)\s+(\\[a-zA-Z])', r'\1 $\2', text)
     # bare LaTeX 명령어 / subscript/superscript → $...$ 감싸기 (이스케이프 전에 처리)
     text = wrap_bare_latex_in_text(text)
-    # 1단계: 기존 $...$ 수식 분리 → 수식 부분은 건드리지 않음
-    parts = re.split(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)", text)
+    # 1단계: 기존 $...$ 수식 + 보호된 math 환경 + \[...\] 분리 → 건드리지 않음
+    _SPLIT_PAT = re.compile(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$|\\\[.*?\\\]|MATHENVPROTECT\d+END)", re.DOTALL)
+    parts = _SPLIT_PAT.split(text)
     result = []
     for i, part in enumerate(parts):
         if i % 2 == 1:
-            result.append(part)  # 기존 수식: 그대로
+            result.append(part)  # 기존 수식 또는 보호된 환경: 그대로
         else:
             # Unicode 수식 기호 → $...$  (escape_latex 적용 전에 먼저 변환)
             part = unicode_math_to_inline_latex(part)
-            # 2단계: 새로 생긴 $...$ 도 보호 — 플레이스홀더 없이 다시 분리
-            subparts = re.split(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)", part)
+            # 2단계: 새로 생긴 $...$, \[...\] 도 보호 — 플레이스홀더 없이 다시 분리
+            subparts = re.split(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$|\\\[.*?\\\])", part, flags=re.DOTALL)
             for j, subpart in enumerate(subparts):
                 if j % 2 == 1:
                     result.append(subpart)  # 새 수식: 그대로
                 else:
                     result.append(escape_latex(subpart))
-    return "".join(result)
+    text = "".join(result)
+
+    # 보호된 math 환경 복원
+    for k, v in _env_store.items():
+        text = text.replace(k, v)
+
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +583,8 @@ def _compile(tex_path: str, config: dict) -> tuple[bool, str]:
 
     for run in range(1, 3):
         try:
+            import sys as _sys
+            _cflags = subprocess.CREATE_NO_WINDOW if _sys.platform == "win32" else 0
             proc = subprocess.run(
                 cmd,
                 cwd=tex_dir,
@@ -539,6 +593,7 @@ def _compile(tex_path: str, config: dict) -> tuple[bool, str]:
                 encoding="utf-8",
                 errors="replace",
                 timeout=120,
+                creationflags=_cflags,
             )
         except FileNotFoundError:
             return False, "xelatex 명령어를 찾을 수 없습니다. XeLaTeX이 설치되어 있는지 확인하세요."

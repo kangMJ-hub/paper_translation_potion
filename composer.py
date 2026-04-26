@@ -291,6 +291,46 @@ def _check_brace_balance(text: str) -> bool:
     return depth == 0
 
 
+def _auto_fix_braces(text: str) -> str:
+    """{ } 개수 불균형을 자동 보정한다 (소규모 불균형 전용)."""
+    opens = text.count("{") - text.count("\\{")
+    closes = text.count("}") - text.count("\\}")
+    diff = opens - closes
+    if diff > 0:
+        return text + "}" * diff
+    elif diff < 0:
+        result = text
+        for _ in range(-diff):
+            idx = result.rfind("}")
+            if idx == -1:
+                break
+            result = result[:idx] + result[idx + 1:]
+        return result
+    return text
+
+
+def _verbatim_fallback(text: str) -> str:
+    """수식을 LaTeX로 렌더링할 수 없을 때 원문 코드를 texttt로 표시한다."""
+    _ESC_MAP = {
+        "\\": r"\textbackslash{}",
+        "{":  r"\{",
+        "}":  r"\}",
+        "$":  r"\$",
+        "_":  r"\_",
+        "^":  r"\^{}",
+        "&":  r"\&",
+        "%":  r"\%",
+        "#":  r"\#",
+        "~":  r"\textasciitilde{}",
+    }
+    safe = re.sub(
+        r'[\\{}$_^&%#~]',
+        lambda m: _ESC_MAP[m.group(0)],
+        text[:300]
+    )
+    return f"\\noindent{{\\small\\texttt{{{safe}}}}}\n\n"
+
+
 def _is_pure_eq_paragraph(text: str) -> bool:
     """
     paragraph 블록이 display equation으로 승격돼야 하는지 판별한다.
@@ -323,8 +363,12 @@ def _filter_format_equation(text: str) -> str:
         if end_tag in stripped:
             result = f"\\begin{{equation}}\n{stripped}\n\\end{{equation}}"
             if not _check_brace_balance(result):
-                print(f"[composer] equation {{ 불균형(inner env), 블록 생략: {text[:60]!r}", file=sys.stderr)
-                return "% [수식 생략: LaTeX 중괄호 불균형]\n"
+                fixed = _auto_fix_braces(result)
+                if _check_brace_balance(fixed):
+                    print(f"[composer] equation {{ 불균형 자동 보정(inner env): {text[:60]!r}", file=sys.stderr)
+                    return fixed
+                print(f"[composer] equation {{ 불균형 → verbatim 폴백: {text[:60]!r}", file=sys.stderr)
+                return _verbatim_fallback(text)
             return result
         # \end{...} 없으면 환경 태그 제거 후 일반 equation으로 처리
         stripped = _INNER_ENV.sub("", stripped).strip()
@@ -386,10 +430,14 @@ def _filter_format_equation(text: str) -> str:
         prose = _escape_latex_text(" ".join(prose_lines))
         result += "\n\n" + prose
 
-    # { } 균형 체크 — 불균형이면 컴파일 중단 방지를 위해 블록 생략
+    # { } 균형 체크 — 소규모 불균형은 자동 보정, 실패 시 verbatim 폴백
     if not _check_brace_balance(result):
-        print(f"[composer] equation {{ 불균형, 블록 생략: {text[:60]!r}", file=sys.stderr)
-        return "% [수식 생략: LaTeX 중괄호 불균형]\n"
+        fixed = _auto_fix_braces(result)
+        if _check_brace_balance(fixed):
+            print(f"[composer] equation {{ 불균형 자동 보정: {text[:60]!r}", file=sys.stderr)
+            return fixed
+        print(f"[composer] equation {{ 불균형 → verbatim 폴백: {text[:60]!r}", file=sys.stderr)
+        return _verbatim_fallback(text)
 
     return result
 

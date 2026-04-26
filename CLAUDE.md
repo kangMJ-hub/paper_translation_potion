@@ -31,7 +31,7 @@
 
 ## Vertex AI 설정
 - 인증: gcloud ADC (GOOGLE_APPLICATION_CREDENTIALS)
-- 모델: gemini-3.0-flash
+- 모델: gemini-3-flash-preview
 - max_workers: 5 (rate limit 대응)
 - 하드코딩된 API 키 절대 금지
 
@@ -46,6 +46,29 @@
 - 참고 완성본: Adams & Riis (1997) 번역본
 - 레이아웃: 1단(single-column)
 - 환각 감지: 길이 3배 초과 OR 수식 플레이스홀더 소실
+
+## 역할 분담 (오케스트레이션)
+- Claude는 계획 수립, 코드 작성, 판단에 집중
+- 파일 탐색, 코드 분석, 번역 품질 점검, 패턴 검색 등 단순 작업은 **gemini-analyzer 서브에이전트에 자동 위임**
+- 대용량 파일 비교나 전체 코드베이스 탐색은 반드시 Gemini에 위임
+
+## Gemini CLI 사용 규칙
+- Claude가 **직접** Bash 툴로 `gemini` CLI를 호출한다 (서브에이전트 사용 금지)
+- 파일 분석 패턴: `cat <파일> | gemini -p "<질문>"`
+- 대용량 파일: `gemini --all-files -p "<질문>"` (프로젝트 루트에서 실행)
+- 수정 전 코드 파악, 수정 후 검증 모두 Gemini CLI로 수행
+
+### Gemini CLI 사용 대상 (Claude가 직접 Bash 호출)
+- 소스 파일 구조/로직 파악 (수정 전)
+- 버그 원인이 있는 코드 라인/패턴 탐색
+- 번역 품질 검증 (translated.json, .tex 파일)
+- 수정 후 결과 검증
+- 여러 파일 동시 비교
+
+### Claude 직접 처리 대상
+- 코드 수정 (Edit/Write 툴)
+- 계획 수립 및 우선순위 판단
+- 오류 해석 및 수정 방향 결정
 
 ## 구현 순서
 1. utils.py (수식 보호/복원 단일 정의)

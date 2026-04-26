@@ -13,7 +13,7 @@ import re
 def protect_equations(text: str) -> tuple[str, dict]:
     """
     수식을 __EQ0__, __EQ1__, ... 플레이스홀더로 치환한다.
-    치환 순서: $$ → \\begin{equation} → $  (순서 중요)
+    치환 순서: $$ → \\begin{equation} → aligned/align → $
     반환: (보호된 텍스트, {플레이스홀더: 원본수식} 매핑)
     """
     mapping: dict[str, str] = {}
@@ -27,9 +27,10 @@ def protect_equations(text: str) -> tuple[str, dict]:
 
     # 1) display math: $$...$$
     text = re.sub(r'\$\$.*?\$\$', replace_match, text, flags=re.DOTALL)
-    # 2) equation 환경: \begin{equation}...\end{equation}
+    # 2) equation/align 환경
     text = re.sub(
-        r'\\begin\{equation\}.*?\\end\{equation\}',
+        r'\\begin\{(?:equation|align\*?|gather\*?|multline\*?|aligned)\}.*?'
+        r'\\end\{(?:equation|align\*?|gather\*?|multline\*?|aligned)\}',
         replace_match, text, flags=re.DOTALL
     )
     # 3) inline math: $...$
@@ -98,8 +99,12 @@ def fix_gemini_latex(text: str) -> str:
             continue
         latex_cmds = re.findall(r'\\[a-zA-Z]+', stripped)
         korean = re.findall(r'[가-힣]', stripped)
-        if len(latex_cmds) >= 2 and not korean and len(stripped) < 300:
-            wrapped.append(f'${stripped}$')
+        if len(latex_cmds) >= 2 and not korean:
+            if len(stripped) < 300:
+                wrapped.append(f'${stripped}$')
+            else:
+                # 긴 순수 수식 줄 → display math로 감싸기
+                wrapped.append(f'\\[\n{stripped}\n\\]')
         else:
             wrapped.append(line)
     return '\n'.join(wrapped)
@@ -291,8 +296,12 @@ _BARE_SUBSUP = re.compile(
 )
 
 # \frac{...}{...}, \sqrt{...} 등 인자형 bare 명령어 패턴 (\begin, \end 제외)
+# 중첩 {} 4단계까지 처리 (예: \sqrt{\frac{\Omega^{\prime}+\Delta}{2\Omega^{\prime}}})
+_BRACE_L2 = r'(?:[^{}]|\{[^{}]*\})*'
+_BRACE_L3 = r'(?:[^{}]|\{' + _BRACE_L2 + r'\})*'
+_BRACE_L4 = r'(?:[^{}]|\{' + _BRACE_L3 + r'\})*'
 _BARE_CMD_ARGS = re.compile(
-    r"(\\(?!begin\b|end\b)[a-zA-Z]+(?:\{(?:[^{}]|\{[^{}]*\})*\}){1,3})"
+    r"(\\(?!begin\b|end\b)[a-zA-Z]+(?:\{" + _BRACE_L4 + r"\}){1,3})"
 )
 
 
@@ -303,7 +312,7 @@ def wrap_bare_latex_in_text(text: str) -> str:
     - 수학 명령어: \\rightarrow, \\pm 등
     이미 $...$ 안에 있는 내용은 건드리지 않는다.
     """
-    _MATH_SPLIT = re.compile(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$)")
+    _MATH_SPLIT = re.compile(r"(\$\$[^$]*?\$\$|\$[^$\n]+?\$|\\\[.*?\\\])", re.DOTALL)
 
     def _process_plain(plain: str) -> str:
         # 0) 연속 LaTeX 명령어(\Gamma\sim\delta 등) → $...$로 감싸기

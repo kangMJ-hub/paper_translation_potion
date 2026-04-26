@@ -13,8 +13,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import vertexai
-from vertexai.generative_models import GenerativeModel
+from google import genai
+from google.genai import types
 
 from utils import fix_gemini_latex, apply_term_dict, protect_equations, restore_equations
 
@@ -39,26 +39,22 @@ def translate(paper: dict, config: dict) -> dict:
     - 캐시 적중 시 API 호출 생략
     - ThreadPoolExecutor로 병렬 처리
     """
-    _init_vertex(config)
+    client = _init_client(config)
 
-    model_name = config.get("model", "gemini-3.0-flash")
+    model_name = config.get("model", "gemini-3-flash-preview")
     max_workers = config.get("max_workers", 5)
     cache_file = config.get("cache_file", "output/translated_blocks.json")
 
     system_prompt = _build_system_prompt(config.get("translation_style", "합니다체"))
-    model = GenerativeModel(
-        model_name,
-        system_instruction=system_prompt,
-    )
-    eq_model = GenerativeModel(
-        model_name,
+    translate_cfg = types.GenerateContentConfig(system_instruction=system_prompt)
+    eq_cfg = types.GenerateContentConfig(
         system_instruction=(
             "You are a LaTeX math expert. "
             "Convert equation text extracted from a PDF into valid LaTeX math code. "
             "Output only the LaTeX math content — no surrounding $$, "
             r"\begin{equation}"
             ", or explanation."
-        ),
+        )
     )
     cache = _load_cache(cache_file)
 
@@ -84,9 +80,9 @@ def translate(paper: dict, config: dict) -> dict:
                 translated_block["translated_text"] = cached
             else:
                 if btype in _EQUATION_TYPES:
-                    result = _normalize_equation(block, eq_model, config)
+                    result = _normalize_equation(block, client, model_name, eq_cfg, config)
                 else:
-                    result = _translate_block(block, model, config)
+                    result = _translate_block(block, client, model_name, translate_cfg, config)
                 # 번역 실패 캐시 오염 방지:
                 # paragraph 계열 블록에서 결과가 원문과 동일하고 한국어가 없으면
                 # 캐시에 저장하지 않아 다음 실행 시 재시도하게 한다.
@@ -126,7 +122,8 @@ def translate(paper: dict, config: dict) -> dict:
 # 단일 블록 번역
 # ---------------------------------------------------------------------------
 
-def _normalize_equation(block: dict, model: GenerativeModel, config: dict) -> str:
+def _normalize_equation(block: dict, client: genai.Client, model_name: str,
+                        cfg: types.GenerateContentConfig, config: dict) -> str:
     """
     PDF 추출 수식 텍스트를 유효한 LaTeX 수식으로 정규화한다.
     이미 LaTeX인 경우 그대로 반환. 최종 실패 시 원문 반환.
@@ -140,8 +137,10 @@ def _normalize_equation(block: dict, model: GenerativeModel, config: dict) -> st
 
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(
-                f"Convert this equation to LaTeX math:\n{text}"
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"Convert this equation to LaTeX math:\n{text}",
+                config=cfg,
             )
             return response.text.strip()
         except Exception as e:
@@ -157,11 +156,12 @@ def _normalize_equation(block: dict, model: GenerativeModel, config: dict) -> st
     return text
 
 
-def _translate_block(block: dict, model: GenerativeModel, config: dict) -> str:
+def _translate_block(block: dict, client: genai.Client, model_name: str,
+                     cfg: types.GenerateContentConfig, config: dict) -> str:
     """
     단일 블록을 번역한다.
     1. protect_equations()로 수식을 플레이스홀더로 치환
-    2. Vertex AI API 호출 (system_instruction은 model에 이미 설정됨)
+    2. Vertex AI API 호출
     3. restore_equations()로 플레이스홀더를 원래 수식으로 복원
     4. 환각 감지 (길이 3배 초과) → 재시도
     5. fix_gemini_latex(), apply_term_dict() 적용
@@ -175,7 +175,11 @@ def _translate_block(block: dict, model: GenerativeModel, config: dict) -> str:
 
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(f"번역할 텍스트:\n{protected}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"번역할 텍스트:\n{protected}",
+                config=cfg,
+            )
             translated = response.text.strip()
             translated = restore_equations(translated, eq_map)
 
@@ -246,21 +250,19 @@ def _build_system_prompt(style: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Vertex AI 초기화
+# google-genai 클라이언트 초기화
 # ---------------------------------------------------------------------------
 
-def _init_vertex(config: dict) -> None:
-    """Vertex AI를 초기화한다. ADC 인증 사용."""
+def _init_client(config: dict) -> genai.Client:
+    """google-genai Client를 생성한다. ADC 인증 사용."""
     project_id = config.get("project_id", "")
-    location = config.get("location", "us-central1")
+    location = config.get("location", "global")
     if not project_id:
         raise ValueError(
             "config.yaml에 project_id가 설정되지 않았습니다.\n"
             "config.yaml의 project_id를 GCP 프로젝트 ID로 설정하세요."
         )
     # 한국어 Windows에서 gcloud가 CP949로 출력해 UnicodeDecodeError 발생 방지.
-    # generate_content() 첫 호출 시 lazy credential 로딩에도 적용되어야 하므로
-    # 패치를 세션 전체에 유지 (finally로 원복하지 않음). 중복 패치 방지.
     import google.auth._cloud_sdk as _cs
     if not getattr(_cs, "_cp949_patched", False):
         _orig = _cs.get_project_id
@@ -271,7 +273,7 @@ def _init_vertex(config: dict) -> None:
                 return _pid
         _cs.get_project_id = _safe
         _cs._cp949_patched = True
-    vertexai.init(project=project_id, location=location)
+    return genai.Client(vertexai=True, project=project_id, location=location)
 
 
 # ---------------------------------------------------------------------------

@@ -53,13 +53,21 @@ def extract(pdf_path: str, config: dict | None = None) -> dict:
         )
 
     # ── 1단계: Document AI 호출 ──────────────────────────────────────────
-    dai_document = _call_documentai(pdf_path, project_id, location, processor_id)
     # Layout Parser는 document.pages가 비어 있으므로 PyMuPDF로 페이지 수 획득
     with fitz.open(pdf_path) as _tmp:
         total_pages = _tmp.page_count
 
+    _DOCAI_LIMIT = 30
+    if total_pages > _DOCAI_LIMIT:
+        dai_document, raw_blocks = _call_documentai_chunked(
+            pdf_path, project_id, location, processor_id,
+            total_pages, _DOCAI_LIMIT
+        )
+    else:
+        dai_document = _call_documentai(pdf_path, project_id, location, processor_id)
+        raw_blocks = _parse_blocks(dai_document)
+
     # ── 2단계: 블록 변환 + 후처리 ────────────────────────────────────────
-    raw_blocks = _parse_blocks(dai_document)
     blocks     = _postprocess(raw_blocks, pdf_path)
 
     # ── 3단계: 그림 PNG 추출 ──────────────────────────────────────────────
@@ -150,6 +158,102 @@ def _call_documentai(
     return doc
 
 
+class _ChunkedDocumentProxy:
+    """여러 청크 Document의 pages를 페이지 오프셋과 함께 합친 경량 래퍼."""
+
+    class _DummyLayout:
+        def __init__(self):
+            self.blocks = []
+
+    class _OffsetPage:
+        """page_number를 청크 오프셋만큼 보정하는 페이지 프록시."""
+        def __init__(self, page, offset: int):
+            self._page  = page
+            self._offset = offset
+
+        @property
+        def page_number(self):
+            return self._page.page_number + self._offset
+
+        @property
+        def dimension(self):
+            return self._page.dimension
+
+        @property
+        def visual_elements(self):
+            return self._page.visual_elements
+
+    def __init__(self):
+        self.document_layout = self._DummyLayout()
+        self.pages: list = []
+
+    def add_chunk(self, doc: documentai.Document, page_offset: int) -> None:
+        for page in doc.pages:
+            self.pages.append(self._OffsetPage(page, page_offset))
+
+
+def _call_documentai_chunked(
+    pdf_path: str,
+    project_id: str,
+    location: str,
+    processor_id: str,
+    total_pages: int,
+    limit: int = 30,
+) -> tuple:
+    """
+    30페이지 초과 PDF를 limit 페이지 단위로 분할해 Document AI를 호출하고
+    (merged_proxy_document, merged_raw_blocks)를 반환한다.
+    """
+    import tempfile
+
+    n_chunks = (total_pages + limit - 1) // limit
+    print(
+        f"[extractor] PDF {total_pages}페이지 → {n_chunks}청크로 분할 처리 (한도: {limit}p)",
+        flush=True,
+    )
+
+    merged_proxy = _ChunkedDocumentProxy()
+    all_blocks: list[dict] = []
+    seen_title = [False]  # 청크 간 title 승격 상태 공유
+
+    with fitz.open(pdf_path) as src_doc:
+        for chunk_idx in range(n_chunks):
+            start_0 = chunk_idx * limit          # 0-based 시작 페이지
+            end_0   = min(start_0 + limit, total_pages) - 1  # 0-based 종료 페이지(포함)
+            page_offset = start_0                # chunk 내 page 1 = 전체 start_0+1
+
+            tmp_pdf = os.path.join(
+                tempfile.gettempdir(),
+                f"_phys_trans_chunk_{chunk_idx}.pdf",
+            )
+            chunk_fitz = fitz.open()
+            chunk_fitz.insert_pdf(src_doc, from_page=start_0, to_page=end_0)
+            chunk_fitz.save(tmp_pdf)
+            chunk_fitz.close()
+
+            try:
+                print(
+                    f"[extractor] 청크 {chunk_idx + 1}/{n_chunks}: "
+                    f"페이지 {start_0 + 1}~{end_0 + 1}",
+                    flush=True,
+                )
+                chunk_doc = _call_documentai(tmp_pdf, project_id, location, processor_id)
+                chunk_blocks = _parse_blocks(
+                    chunk_doc,
+                    page_offset=page_offset,
+                    seen_title=seen_title,
+                )
+                all_blocks.extend(chunk_blocks)
+                merged_proxy.add_chunk(chunk_doc, page_offset)
+            finally:
+                try:
+                    os.remove(tmp_pdf)
+                except OSError:
+                    pass
+
+    return merged_proxy, all_blocks
+
+
 # ---------------------------------------------------------------------------
 # 2단계: 블록 변환
 # ---------------------------------------------------------------------------
@@ -170,7 +274,11 @@ _DL_TYPE_MAP = {
 }
 
 
-def _parse_blocks(document: documentai.Document) -> list[dict]:
+def _parse_blocks(
+    document: documentai.Document,
+    page_offset: int = 0,
+    seen_title: list | None = None,
+) -> list[dict]:
     """
     Document AI document_layout.blocks (계층 트리) → 내부 블록 리스트로 변환한다.
 
@@ -178,10 +286,14 @@ def _parse_blocks(document: documentai.Document) -> list[dict]:
     document.document_layout.blocks에 계층 구조로 데이터를 반환한다.
     각 Block은 text_block.type_, text_block.text, text_block.blocks(하위)와
     page_span.page_start를 가진다.
+
+    page_offset: 청크 분할 시 chunk 내부 페이지 번호(1-based)에 더할 값
+    seen_title:  청크 간 title 승격 상태를 공유하기 위한 외부 리스트 [bool]
     """
     blocks: list[dict] = []
     block_id_counter = [0]  # mutable container for nested function
-    seen_title = [False]    # 첫 번째 heading-1 → title로 처리
+    if seen_title is None:
+        seen_title = [False]    # 첫 번째 heading-1 → title로 처리
 
     def _emit(our_type: str, text: str, page_num: int) -> None:
         """검증 후 블록 리스트에 추가한다."""
@@ -209,7 +321,7 @@ def _parse_blocks(document: documentai.Document) -> list[dict]:
         tb = layout_block.text_block   # LayoutTextBlock (없으면 None)
         ps = layout_block.page_span    # LayoutPageSpan
 
-        page_num = ps.page_start if (ps and ps.page_start) else inherited_page
+        page_num = (ps.page_start if (ps and ps.page_start) else inherited_page) + page_offset
 
         if tb is None:
             return
@@ -395,8 +507,15 @@ def _classify_paragraph(text: str, position: int) -> str:
     if re.match(r"^\[\d+\]", stripped):
         return "reference"
     # "1) Author..." / "1. Author..." 형식 참고문헌 (position > 20 : 너무 앞은 제외)
+    # 년도(19xx/20xx), et al., 저널명 등 참고문헌 마커가 있어야 함 (본문 번호 목록과 구분)
     if re.match(r"^\d{1,2}[)\.]\s*[A-Z]", stripped) and position > 20:
-        return "reference"
+        has_ref_markers = bool(
+            re.search(r"\b(19|20)\d{2}\b", stripped)
+            or re.search(r"\bet\s+al\b\.?", stripped, re.IGNORECASE)
+            or re.search(r"\b(Phys\.|Rev\.|Lett\.|J\.|Nature|Science|arXiv|doi|ibid)\b", stripped)
+        )
+        if has_ref_markers:
+            return "reference"
 
     # ── 각주 ─────────────────────────────────────────────────────────────
     # "5 URL...", "6 Shown as...", "7 For the B band..." 형태의 각주
@@ -420,7 +539,14 @@ def _classify_paragraph(text: str, position: int) -> str:
 
     # ── 저자 ────────────────────────────────────────────────────────────
     if position < 5 and len(stripped) < 800:
-        if re.match(r"^[A-Z][a-z]*\.?\s+[A-Z][a-z]", stripped):
+        # 일반 문장 시작 패턴(논문 서론 등)이면 저자가 아님
+        _sentence_start = re.match(
+            r"^(The|We|This|In|Our|Here|It|These|Such|Since|For|Although|"
+            r"However|Quantum|Classical|Recently|Previous|Note|While|When|"
+            r"As\s|A\s|An\s)",
+            stripped, re.IGNORECASE,
+        )
+        if not _sentence_start and re.match(r"^[A-Z][a-z]+\.?\s+[A-Z][a-z]", stripped):
             if "," in stripped or " and " in stripped.lower():
                 return "authors"
 
@@ -452,13 +578,75 @@ def _postprocess(blocks: list[dict], pdf_path: str = "") -> list[dict]:
     blocks = _remove_duplicate_blocks(blocks)
     blocks = _remove_running_headers(blocks)
     blocks = _clean_authors_block(blocks)
+    blocks = _reclassify_sections(blocks)
+    blocks = _reclassify_abstract(blocks)
     blocks = _reclassify_ref_section(blocks)
     blocks = _merge_leading_fragments(blocks)
     blocks = _relocate_orphaned_paragraphs(blocks)
     blocks = _sort_figure_captions_by_number(blocks)
+    blocks = _sort_table_captions_by_number(blocks)
     if pdf_path:
         blocks = _fix_references_fallback(blocks, pdf_path)
     return blocks
+
+
+def _reclassify_abstract(blocks: list[dict]) -> list[dict]:
+    """
+    title/authors 이후 첫 section 이전의 paragraph 블록들을 abstract로 재분류한다.
+    - Document AI가 "Abstract" 헤더와 내용을 분리해 내용 블록이 paragraph로 분류되는 문제 해결
+    - 최대 5개 단락까지만 abstract로 간주 (과도한 재분류 방지)
+    """
+    # 이미 abstract가 있으면 스킵
+    if any(b["type"] == "abstract" for b in blocks):
+        return blocks
+
+    # title/authors 블록의 마지막 위치 찾기
+    last_meta_idx = -1
+    for i, b in enumerate(blocks):
+        if b["type"] in ("title", "authors"):
+            last_meta_idx = i
+
+    if last_meta_idx < 0:
+        return blocks
+
+    # title/authors 이후 첫 section 이전 paragraph들을 abstract로
+    result = []
+    abstract_count = 0
+    in_abstract_zone = False
+    for i, b in enumerate(blocks):
+        if i == last_meta_idx + 1:
+            in_abstract_zone = True
+        if in_abstract_zone:
+            if b["type"] in ("section", "subsection"):
+                in_abstract_zone = False
+            elif b["type"] == "paragraph" and abstract_count < 5:
+                # "Abstract" 키워드 단독 블록은 제거 (헤더 역할)
+                if re.match(r"^abstract\s*$", b.get("text", "").strip(), re.IGNORECASE):
+                    continue
+                result.append({**b, "type": "abstract"})
+                abstract_count += 1
+                continue
+            else:
+                in_abstract_zone = False
+        result.append(b)
+    return result
+
+
+def _reclassify_sections(blocks: list[dict]) -> list[dict]:
+    """
+    Document AI가 주요 섹션(로마 숫자 헤딩)을 subsection으로 잘못 분류한 경우 교정한다.
+    - 'I.', 'II.', 'III.' 등 로마 숫자로 시작하는 subsection → section으로 승격
+    - 알파벳 소절 (A., B., ...) → subsection 유지
+    - title은 건드리지 않음
+    """
+    _roman_pat = re.compile(r"^[IVX]+[.\s]+[A-Z]")
+    result = []
+    for b in blocks:
+        if b["type"] == "subsection" and _roman_pat.match(b.get("text", "").strip()):
+            result.append({**b, "type": "section"})
+        else:
+            result.append(b)
+    return result
 
 
 def _reclassify_ref_section(blocks: list[dict]) -> list[dict]:
@@ -479,7 +667,7 @@ def _reclassify_ref_section(blocks: list[dict]) -> list[dict]:
             # 참고문헌 섹션 내 표 캡션 → 참고문헌 모드 해제 후 그대로 보존
             in_ref_section = False
             result.append(b)
-        elif in_ref_section and b["type"] == "paragraph":
+        elif in_ref_section and b["type"] in ("paragraph", "footnote"):
             result.append({**b, "type": "reference"})
         else:
             result.append(b)
@@ -594,6 +782,41 @@ def _relocate_orphaned_paragraphs(blocks: list[dict]) -> list[dict]:
         result.insert(insert_pos + 1, orphan)
         offset -= 1  # 삭제로 인한 인덱스 보정
 
+    return result
+
+
+def _sort_table_captions_by_number(blocks: list[dict]) -> list[dict]:
+    """
+    table_caption 블록을 표 번호(아라비아 숫자 또는 로마 숫자) 오름차순으로 재정렬한다.
+
+    2단 조판 논문에서 DocAI가 캡션을 컬럼 순서로 읽어
+    TABLE III이 TABLE II보다 먼저 오는 경우를 교정한다.
+    각 캡션이 차지하던 위치(슬롯)는 그대로 유지하고 내용만 번호 순으로 교체한다.
+    """
+    _ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+               "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
+
+    def _tbl_num(b: dict) -> int:
+        text = b.get("text", "")
+        m = re.search(r"\b([IVX]+|\d+)\b", text)
+        if not m:
+            return 9999
+        s = m.group(1)
+        if s in _ROMAN:
+            return _ROMAN[s]
+        try:
+            return int(s)
+        except ValueError:
+            return 9999
+
+    cap_indices = [i for i, b in enumerate(blocks) if b["type"] == "table_caption"]
+    if len(cap_indices) <= 1:
+        return blocks
+
+    caps_sorted = sorted((blocks[i] for i in cap_indices), key=_tbl_num)
+    result = list(blocks)
+    for idx, cap in zip(cap_indices, caps_sorted):
+        result[idx] = cap
     return result
 
 
@@ -1379,7 +1602,9 @@ def _detect_layout(pdf_path: str) -> str:
                 return "onecolumn"
 
             twocol_votes = votes.count("twocolumn")
-            layout = "twocolumn" if twocol_votes > len(votes) / 2 else "onecolumn"
+            # 1개라도 twocolumn 투표가 있으면 twocolumn으로 판정
+            # (첫 페이지가 제목/초록 전체폭이라 onecolumn으로 오판해도 보정됨)
+            layout = "twocolumn" if twocol_votes >= 1 else "onecolumn"
             print(f"[extractor] 레이아웃 감지: {layout} (투표: {votes})", flush=True)
             return layout
 

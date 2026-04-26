@@ -73,6 +73,7 @@
 
 ((*- if reference_blocks *))
 \par\vspace{2em}{\Large\textbf{참고문헌}}\par\vspace{0.5em}
+((*- if ref_style == "numbered" *))
 \begin{thebibliography}{99}
 ((*- set ns = namespace(ref_counter=0) *))
 ((*- for ref in reference_blocks *))
@@ -87,6 +88,15 @@
 ((*- endfor *))
 ((*- endfor *))
 \end{thebibliography}
+((*- else *))
+\begin{flushleft}
+((*- for ref in reference_blocks *))
+((*- for entry in ref.text | split_refs *))
+((( entry | escape_latex )))\\[2pt]
+((*- endfor *))
+((*- endfor *))
+\end{flushleft}
+((*- endif *))
 ((*- endif *))
 
 \end{document}

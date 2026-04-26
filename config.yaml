@@ -4,8 +4,8 @@
 
 # Vertex AI
 project_id: "paper-translator-potion"
-location: "us-central1"
-model: "gemini-2.5-flash"
+location: "global"
+model: "gemini-3-flash-preview"
 
 # Document AI Layout Parser
 # 프로세서 생성: https://console.cloud.google.com/ai/document-ai

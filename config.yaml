@@ -1,31 +1,17 @@
-# Physics-Trans v2.0 설정 파일
-# 주의: API 키 및 인증 정보 절대 하드코딩 금지
-# 인증: gcloud auth application-default login 또는 GOOGLE_APPLICATION_CREDENTIALS 환경변수 사용
-
-# Vertex AI
-project_id: "paper-translator-potion"
-location: "global"
-model: "gemini-3-flash-preview"
-
-# Document AI Layout Parser
-# 프로세서 생성: https://console.cloud.google.com/ai/document-ai
-docai_location: "us"          # 프로세서 리전 (us 또는 eu)
-docai_processor_id: "272be2d68ebb4a12"
-
-# 번역 설정
-translation_style: "한다체"
-max_workers: 5
-max_retries: 3
+cache_file: output/translated_blocks.json
+docai_location: us
+docai_processor_id: 272be2d68ebb4a12
+document_class: revtex4-2
+figures_dir: output/figures
 hallucination_ratio: 3.0
-
-# LaTeX 설정
-document_class: "revtex4-2"
-layout: "onecolumn"
-main_font: "UnBatang"
-sans_font: "UnDotum"
-
-# 경로
-output_dir: "output"
-figures_dir: "output/figures"
-cache_file: "output/translated_blocks.json"
-template_file: "template.tex.j2"
+layout: onecolumn
+location: global
+main_font: UnBatang
+max_retries: 3
+max_workers: 5
+model: gemini-3-flash-preview
+output_dir: output
+project_id: paper-translator-potion
+sans_font: UnDotum
+template_file: template.tex.j2
+translation_style: 한다체

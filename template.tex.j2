@@ -46,7 +46,14 @@
 
 ((*- elif block.type == 'equation' *))
 
+((*- if block.img_path *))
+\begin{center}
+  \adjustbox{max width=0.8\columnwidth}{\includegraphics{figures/((( block.img_path | basename )))}}
+\end{center}
+((*- else *))
 ((( (block.translated_text or block.text) | format_equation )))
+((*- endif *))
+
 
 ((*- elif block.type == 'figure_caption' *))
 

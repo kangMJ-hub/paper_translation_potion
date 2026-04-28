@@ -271,6 +271,7 @@ _DL_TYPE_MAP = {
     "table":     "table",
     "list-item": "paragraph",
     "subtitle":  "paragraph",
+    "formula":   "equation",   # DocAI Layout Parser 수식 블록
 }
 
 
@@ -546,7 +547,10 @@ def _classify_paragraph(text: str, position: int) -> str:
             r"As\s|A\s|An\s)",
             stripped, re.IGNORECASE,
         )
-        if not _sentence_start and re.match(r"^[A-Z][a-z]+\.?\s+[A-Z][a-z]", stripped):
+        if not _sentence_start and (
+            re.match(r"^[A-Z][a-z]+\.?\s+[A-Z][a-z]", stripped)   # "John Smith..."
+            or re.match(r"^[A-Z]\.\s+[A-Z][a-z]", stripped)        # "T. Chanelière..."
+        ):
             if "," in stripped or " and " in stripped.lower():
                 return "authors"
 
@@ -582,6 +586,7 @@ def _postprocess(blocks: list[dict], pdf_path: str = "") -> list[dict]:
     blocks = _reclassify_abstract(blocks)
     blocks = _reclassify_ref_section(blocks)
     blocks = _merge_leading_fragments(blocks)
+    blocks = _merge_caption_continuations(blocks)   # 캡션 연속 단편 병합
     blocks = _relocate_orphaned_paragraphs(blocks)
     blocks = _sort_figure_captions_by_number(blocks)
     blocks = _sort_table_captions_by_number(blocks)
@@ -596,9 +601,19 @@ def _reclassify_abstract(blocks: list[dict]) -> list[dict]:
     - Document AI가 "Abstract" 헤더와 내용을 분리해 내용 블록이 paragraph로 분류되는 문제 해결
     - 최대 5개 단락까지만 abstract로 간주 (과도한 재분류 방지)
     """
-    # 이미 abstract가 있으면 스킵
+    # DocAI가 이미 abstract를 할당한 경우: 1개 초과분은 paragraph로 변환
+    # (PRL Letter 형식은 abstract가 항상 단일 단락)
     if any(b["type"] == "abstract" for b in blocks):
-        return blocks
+        abstract_seen = 0
+        result = []
+        for b in blocks:
+            if b["type"] == "abstract":
+                abstract_seen += 1
+                if abstract_seen > 1:
+                    result.append({**b, "type": "paragraph"})
+                    continue
+            result.append(b)
+        return result
 
     # title/authors 블록의 마지막 위치 찾기
     last_meta_idx = -1
@@ -609,7 +624,21 @@ def _reclassify_abstract(blocks: list[dict]) -> list[dict]:
     if last_meta_idx < 0:
         return blocks
 
+    # 본문 시작을 나타내는 패턴 (section heading 없는 PRL Letter 스타일 대응)
+    _body_start = re.compile(
+        r"^(이제|We now\b|Now\b|We describe\b|We present our|"
+        r"Step\s*\(|단계\s*\(|We consider\b|In the following|"
+        r"We now describe|The setup|Our approach|"
+        r"In this Letter\b|In this paper\b|In this work\b|"
+        r"In the present\b|Here we\b|Recently\b|"
+        r"A [a-z]+ (network|system|scheme|protocol|method)\b)",
+        re.IGNORECASE,
+    )
+    # 저자 이름 패턴 (abstract 흡수 방지용)
+    _author_pat = re.compile(r"^[A-Z]\.?\s+[A-Z][a-z].*,")
+
     # title/authors 이후 첫 section 이전 paragraph들을 abstract로
+    # 최대 1개 단락 (PRL Letter 형식: abstract는 항상 단일 단락)
     result = []
     abstract_count = 0
     in_abstract_zone = False
@@ -619,15 +648,50 @@ def _reclassify_abstract(blocks: list[dict]) -> list[dict]:
         if in_abstract_zone:
             if b["type"] in ("section", "subsection"):
                 in_abstract_zone = False
-            elif b["type"] == "paragraph" and abstract_count < 5:
+            elif b["type"] == "paragraph" and abstract_count < 1:
+                text = b.get("text", "").strip()
                 # "Abstract" 키워드 단독 블록은 제거 (헤더 역할)
-                if re.match(r"^abstract\s*$", b.get("text", "").strip(), re.IGNORECASE):
+                if re.match(r"^abstract\s*$", text, re.IGNORECASE):
                     continue
-                result.append({**b, "type": "abstract"})
-                abstract_count += 1
-                continue
+                # 저자 이름 패턴 → authors로 재분류
+                if _author_pat.match(text):
+                    result.append({**b, "type": "authors"})
+                    continue
+                # 본문 시작 마커 → abstract 수집 중단
+                if _body_start.match(text):
+                    in_abstract_zone = False
+                else:
+                    result.append({**b, "type": "abstract"})
+                    abstract_count += 1
+                    continue
             else:
                 in_abstract_zone = False
+        result.append(b)
+    return result
+
+
+def _reclassify_math_paragraphs(blocks: list[dict]) -> list[dict]:
+    """
+    순수 LaTeX 수식으로 시작하는 paragraph 블록을 equation으로 재분류한다.
+    DocAI가 display equation을 paragraph로 분류하는 경우 대응.
+    """
+    _math_start = re.compile(
+        r"^(\\frac\{|\\sum|\\int|\\prod|\\left[\(\[\\|]|"
+        r"\\begin\{[a-z]+\*?\}|\\psi|\\phi|\\Psi|\\rho|\\hat\{|"
+        r"\\langle|\\vec\{|\\nabla|\\partial)"
+    )
+    result = []
+    for b in blocks:
+        if b["type"] == "paragraph":
+            text = b.get("text", "").strip()
+            # 순수 LaTeX 수식 패턴: math 명령으로 시작하고 일반 단어 비율이 낮음
+            if _math_start.match(text):
+                # 알파벳 단어 수 대비 LaTeX 명령 수 비교
+                words = re.findall(r"[A-Za-z]{3,}", text)
+                latex_cmds = re.findall(r"\\[a-zA-Z]+", text)
+                if len(latex_cmds) >= 2 and (not words or len(latex_cmds) >= len(words)):
+                    result.append({**b, "type": "equation"})
+                    continue
         result.append(b)
     return result
 
@@ -820,6 +884,75 @@ def _sort_table_captions_by_number(blocks: list[dict]) -> list[dict]:
     return result
 
 
+def _merge_caption_continuations(blocks: list[dict]) -> list[dict]:
+    """
+    figure_caption 직후에 오는 캡션 연속 paragraph를 병합한다.
+
+    DocAI Layout Parser가 긴 그림 캡션을 figure_caption + paragraph 쌍으로
+    분리하거나, 두 칼럼 레이아웃에서 캡션 조각이 비연속으로 산재하는 경우 대응.
+    판별 기준 (figure_caption 이후 최대 10블록 이내):
+    - 소문자로 시작 / 서브그림 레이블 "(b)", "( )" 등 / 연결어
+    - 틸데(~) 포함 텍스트 (DocAI가 두 칼럼 캡션에서 공백을 ~로 인코딩)
+    - 짧은 단편 (< 65 chars) — 본문은 통상 더 길다
+    본문 확실 판별: tilde=0 AND 길이>100 AND 대문자 시작 → 병합 중단
+    """
+    _cont_pat = re.compile(
+        r"^([a-z]"                        # 소문자로 시작 (대소문자 구분)
+        r"|\(\s*[a-zA-Z]?\s*\)\s*"        # ( ) / (d) 서브그림 레이블 (공백 포함)
+        r"|\([a-z]{2,}"                   # (blue...) / (solid...) 등 소문자 단어
+        r"|[Ww]here\b|[Ww]ith\b|[Ff]or\b|[Aa]nd\b)"  # 연결어
+    )
+
+    def _is_caption_fragment(text: str) -> bool:
+        """캡션 조각 여부 판별."""
+        if _cont_pat.match(text):
+            return True
+        # 틸데 포함 (DocAI 두 칼럼 캡션 특징)
+        if text.count("~") > 0 and re.search(r"\w+~\w+", text):
+            return True
+        # 짧은 단편 (< 65 chars) — 캡션 서브파트 경계
+        if len(text) < 65:
+            return True
+        return False
+
+    def _is_body_text(text: str) -> bool:
+        """확실한 본문 텍스트 여부 (병합 중단 신호)."""
+        return (text.count("~") == 0
+                and len(text) > 100
+                and bool(re.match(r"^[A-Z]", text)))
+
+    result = []
+    for b in blocks:
+        text = b.get("text", "").strip()
+        if b["type"] != "paragraph" or not text:
+            result.append(b)
+            continue
+
+        # 최근 figure_caption 탐색 (최대 10블록 이내, 본문 텍스트 이전까지)
+        cap_idx = None
+        for j in range(len(result) - 1, max(len(result) - 11, -1), -1):
+            bt = result[j]["type"]
+            if bt == "figure_caption":
+                cap_idx = j
+                break
+            # 확실한 본문 텍스트를 만나면 탐색 중단
+            if bt == "paragraph" and _is_body_text(result[j].get("text", "")):
+                break
+
+        cap_text = result[cap_idx].get("text", "") if cap_idx is not None else ""
+        if (cap_idx is not None
+                and _is_caption_fragment(text)
+                and len(cap_text) + len(text) < 1500):
+            result[cap_idx] = {
+                **result[cap_idx],
+                "text": cap_text.rstrip() + " " + text,
+            }
+        else:
+            result.append(b)
+
+    return result
+
+
 def _sort_figure_captions_by_number(blocks: list[dict]) -> list[dict]:
     """
     figure_caption 블록을 그림 번호 오름차순으로 재정렬한다.
@@ -916,7 +1049,48 @@ def _fix_references_fallback(blocks: list[dict], pdf_path: str) -> list[dict]:
         f"PyMuPDF {len(mupdf_refs)}개",
         flush=True,
     )
-    return non_refs + new_refs
+
+    # 참고문헌 섹션 내 잔여 fragment 단락 제거
+    # PyMuPDF ref로 교체 후 non_refs에 남아있는 부분 참고문헌 텍스트(paragraph)를 걸러낸다.
+    # (\b를 쓰지 않아 "Phys.", "Lett." 같이 점으로 끝나는 패턴도 정확히 탐지)
+    _ref_journal_pat = re.compile(
+        r"Phys\.|Rev\.|Lett\.|Europhys\.|Nature\b|Science\b|arXiv\b|doi\b|ibid\b|"
+        r"quant-ph/|[Ee]t\s+al\.?"
+    )
+    _ref_status_pat = re.compile(r"\bin\s+press\b|\bto\s+be\s+published\b|\bsubmitted\b")
+    _year_pat = re.compile(r"\b(19|20)\d{2}\b")
+    _vol_page_pat = re.compile(r"\d+,\s*\d+\s*\(")   # "38, 764 ("
+    _author_initial_pat = re.compile(r"[A-Z]\.\s+[A-Z][a-z]+")  # "G. Roger"
+
+    def _is_ref_fragment(block: dict) -> bool:
+        if block["type"] != "paragraph":
+            return False
+        t = block.get("text", "").strip()
+        # 부분 참고문헌 번호: "5] ...", "12] ..."
+        if re.match(r"^\d{1,3}\]", t):
+            return True
+        # "(2004)." 같은 연도+마침표 단편
+        if re.match(r"^\(\d{4}\)\.?$", t):
+            return True
+        # 참고문헌 마커 2개 이상 (길이 제한 없음 — 여러 ref가 이어붙은 긴 fragment도 처리)
+        if len(t) < 400:
+            markers = (
+                bool(_ref_journal_pat.search(t))
+                + bool(_ref_status_pat.search(t))
+                + bool(_year_pat.search(t))
+                + bool(_vol_page_pat.search(t))
+                + bool(_author_initial_pat.search(t))
+            )
+            if markers >= 2:
+                return True
+        return False
+
+    cleaned_non_refs = [b for b in non_refs if not _is_ref_fragment(b)]
+    removed = len(non_refs) - len(cleaned_non_refs)
+    if removed:
+        print(f"[extractor] 참고문헌 잔여 단편 {removed}개 제거", flush=True)
+
+    return cleaned_non_refs + new_refs
 
 
 def _remove_duplicate_blocks(blocks: list[dict]) -> list[dict]:
@@ -1174,17 +1348,17 @@ def _yolo_detect_bboxes(
     page_h_pt: float,
     img_w_px: int,
     img_h_px: int,
-) -> tuple[list[list[float]], list[list[float]]]:
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
     """
-    DocLayout-YOLO로 페이지 이미지에서 figure/table bbox(pt)를 감지한다.
+    DocLayout-YOLO로 페이지 이미지에서 figure/table/formula bbox(pt)를 감지한다.
 
-    반환: (figure_bboxes, table_bboxes) — 각각 [[x0,y0,x1,y1], ...] pt 단위.
+    반환: (figure_bboxes, table_bboxes, formula_bboxes) — 각각 [[x0,y0,x1,y1], ...] pt 단위.
     """
     try:
         from doclayout_yolo import YOLOv10
         import huggingface_hub
     except ImportError:
-        return [], []
+        return [], [], []
 
     model_path = huggingface_hub.hf_hub_download(
         repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
@@ -1201,6 +1375,7 @@ def _yolo_detect_bboxes(
 
     fig_bboxes: list[list[float]] = []
     tbl_bboxes: list[list[float]] = []
+    eq_bboxes:  list[list[float]] = []
     for res in det_res:
         for box in res.boxes:
             cls_id = int(box.cls[0])
@@ -1217,8 +1392,10 @@ def _yolo_detect_bboxes(
                 fig_bboxes.append([x0, y0, x1, y1])
             elif label == "table":
                 tbl_bboxes.append([x0, y0, x1, y1])
+            elif label == "isolate_formula":
+                eq_bboxes.append([x0, y0, x1, y1])
 
-    return fig_bboxes, tbl_bboxes
+    return fig_bboxes, tbl_bboxes, eq_bboxes
 
 
 def _best_yolo_bbox_for_caption(
@@ -1297,6 +1474,7 @@ def _extract_figures(
 
     yolo_page_bboxes: dict[int, list[list[float]]] = {}   # figure bboxes
     yolo_table_bboxes: dict[int, list[list[float]]] = {}  # table bboxes
+    yolo_eq_bboxes: dict[int, list[list[float]]] = {}     # formula bboxes
     yolo_available = False
 
     # 표 캡션 페이지도 YOLO 탐지 대상에 포함
@@ -1316,7 +1494,7 @@ def _extract_figures(
             pix.save(tmp_img)
             img_w_px, img_h_px = pix.width, pix.height
 
-            fig_bboxes, tbl_bboxes = _yolo_detect_bboxes(
+            fig_bboxes, tbl_bboxes, eq_bboxes_page = _yolo_detect_bboxes(
                 tmp_img, page_w_pt, page_h_pt, img_w_px, img_h_px
             )
             try:
@@ -1334,6 +1512,10 @@ def _extract_figures(
                 yolo_available = True
             if tbl_bboxes:
                 yolo_table_bboxes[pn] = tbl_bboxes
+            if eq_bboxes_page:
+                # y 오름차순 정렬 (페이지 내 위→아래 순서)
+                eq_bboxes_page.sort(key=lambda b: b[1])
+                yolo_eq_bboxes[pn] = eq_bboxes_page
 
     if yolo_available:
         total_yolo = sum(len(v) for v in yolo_page_bboxes.values())
@@ -1487,6 +1669,103 @@ def _extract_figures(
                     os.remove(img_info["path"])
             except OSError:
                 pass
+
+    # ── YOLO isolate_formula 크롭 → equation 이미지 블록 삽입 ─────────────
+    if yolo_eq_bboxes:
+        # 텍스트 기반 수식 블록의 페이지별 인덱스 수집 (YOLO 이미지로 교체 대상)
+        text_eq_by_page: dict[int, list[int]] = {}
+        for i, b in enumerate(blocks):
+            if b["type"] == "equation" and not b.get("img_path") and b.get("text", "").strip():
+                text_eq_by_page.setdefault(b.get("page", 0), []).append(i)
+
+        eq_num = 1
+        with fitz.open(pdf_path) as fitz_doc:
+            for pn in sorted(yolo_eq_bboxes.keys()):
+
+                fitz_page = fitz_doc[pn - 1]
+                page_h = fitz_page.rect.height
+                page_w = fitz_page.rect.width
+
+                for bbox in yolo_eq_bboxes[pn]:
+                    eq_path = os.path.join(figures_dir, f"eq_{eq_num:03d}.png")
+                    try:
+                        _crop_and_save(fitz_doc, pn - 1, bbox, eq_path)
+
+                        eq_x_center = (bbox[0] + bbox[2]) / 2
+                        eq_y_center = (bbox[1] + bbox[3]) / 2
+                        rel_y = eq_y_center / max(page_h, 1.0)
+                        is_left_col = eq_x_center < page_w / 2
+
+                        # 해당 페이지의 일반 텍스트 블록 인덱스 수집 (읽기 순서)
+                        page_para_indices = [
+                            i for i, b in enumerate(blocks)
+                            if b.get("page", 1) == pn
+                            and b["type"] in ("paragraph", "abstract", "section", "subsection")
+                        ]
+
+                        if page_para_indices:
+                            n = len(page_para_indices)
+                            # 두 칼럼: 좌칼럼은 앞 절반 블록, 우칼럼은 뒷 절반 블록 사용
+                            split = max(1, n // 2)
+                            col_indices = page_para_indices[:split] if is_left_col else page_para_indices[split:]
+                            if not col_indices:
+                                col_indices = page_para_indices
+                            # 텍스트 길이 가중치 누적으로 y-위치 추정 (긴 단락 = 더 많은 공간)
+                            total_len = sum(len(blocks[i].get("text", "")) for i in col_indices) or 1
+                            cumulative = 0
+                            target_slot = len(col_indices) - 1
+                            for slot, blk_idx in enumerate(col_indices):
+                                cumulative += len(blocks[blk_idx].get("text", ""))
+                                if cumulative / total_len >= rel_y:
+                                    target_slot = slot
+                                    break
+                            insert_idx = col_indices[target_slot] + 1
+                        else:
+                            # fallback: 다음 페이지 첫 블록 앞
+                            insert_idx = len(blocks)
+                            for i, b in enumerate(blocks):
+                                if b.get("page", 1) > pn:
+                                    insert_idx = i
+                                    break
+
+                        blocks.insert(insert_idx, {
+                            "id":       f"eq_img_{eq_num:03d}",
+                            "type":     "equation",
+                            "text":     "",
+                            "img_path": eq_path,
+                            "page":     pn,
+                            "bbox":     bbox,
+                        })
+                        print(
+                            f"[extractor] 수식 이미지 {eq_num} (p.{pn}, y={eq_y_center:.0f}/{page_h:.0f}={rel_y:.2f}): 삽입 위치 {insert_idx}",
+                            flush=True,
+                        )
+                        eq_num += 1
+                    except Exception as e:
+                        print(f"[extractor] 수식 크롭 실패: {e}", file=sys.stderr)
+
+        # YOLO 이미지가 삽입된 페이지: 텍스트 수식 블록 + 순수 수식 단락 제거 (중복 방지)
+        _pure_math_pat = re.compile(
+            r"^\s*(\\frac\{|\\sum|\\int|\\prod|\\left[\(\[|]|\$\\frac|\$\\sum)"
+        )
+        for pn in sorted(yolo_eq_bboxes.keys()):
+            to_remove = []
+            for idx, b in enumerate(blocks):
+                if b.get("page", 0) != pn:
+                    continue
+                if b.get("img_path"):
+                    continue  # YOLO 이미지 블록은 보존
+                if b["type"] == "equation" and b.get("text", "").strip():
+                    to_remove.append(idx)
+                elif b["type"] == "paragraph" and _pure_math_pat.match(b.get("text", "")):
+                    to_remove.append(idx)
+            for idx in sorted(to_remove, reverse=True):
+                blocks.pop(idx)
+                print(f"[extractor] p.{pn}: 수식 텍스트 블록 제거 (YOLO 이미지로 대체)", flush=True)
+
+        total_eq_img = eq_num - 1
+        if total_eq_img > 0:
+            print(f"[extractor] 수식 이미지 {total_eq_img}개 추출 완료", flush=True)
 
     return figures, yolo_page_bboxes
 

@@ -83,6 +83,10 @@ def fix_gemini_latex(text: str) -> str:
     text = re.sub(r'\$\\mathcal\{(\\[a-z]+)\}\$', r'$\1$', text)
     text = re.sub(r'\\mathcal\{(\\[a-z]+)\}', r'\1', text)
 
+    # ^{\{}prime}, _{\{}prime} 등 Gemini 오생성 패턴 → ^{\prime} 형태로 교정
+    # 예: ^{\{}prime} → ^{\prime},  _{\ {}prime} → _{\prime}
+    text = re.sub(r'([_^])\{\\[{}]+([a-zA-Z]+)\\?[{}]?\}', r'\1{\\\2}', text)
+
     # \sqrt 뒤 공백+내용 → \sqrt{내용}  (빈 \sqrt{} 는 건드리지 않음)
     text = re.sub(r'\\sqrt\s+(\S)', r'\\sqrt{\1}', text)
 
@@ -266,13 +270,40 @@ TERM_DICT: dict[str, str] = {
     "Rabi oscillation": "라비 진동",
     "narrow pitch": "미세 피치",
     "narrow-pitch": "미세 피치",
+    # 양자 통신 / 얽힘 관련
+    "idler photon": "아이들러 광자",
+    "signal photon": "신호 광자",
+    "idler field": "아이들러 장",
+    "signal field": "신호 장",
+    "idler": "아이들러",
+    "entanglement": "얽힘",
+    "entangled": "얽힌",
+    "Bell state": "벨 상태",
+    "Bell inequality": "벨 부등식",
+    "Bell's inequality": "벨 부등식",
+    "quantum repeater": "양자 중계기",
+    "quantum teleportation": "양자 전송",
+    "quantum telecommunication": "양자 원거리 통신",
+    "coincidence": "동시 계수",
+    "single photon": "단일 광자",
+    "photon pair": "광자 쌍",
+    "atomic ensemble": "원자 앙상블",
+    "cold atoms": "차가운 원자",
+    "phase matching": "위상 정합",
+    "cascade transition": "cascade 전이",
+    "cascade emission": "cascade 방출",
+    "collective excitation": "집단 들뜸",
+    "collective enhancement": "집단적 강화",
 }
 
 
 def apply_term_dict(text: str) -> str:
-    """번역 후 용어 사전 기반 물리학 용어를 통일한다 (대소문자 구분)."""
-    for eng, kor in TERM_DICT.items():
-        text = text.replace(eng, kor)
+    """번역 후 용어 사전 기반 물리학 용어를 통일한다.
+    긴 용어 먼저 처리하여 'coherent'가 'incoherent' 일부를 치환하는 문제를 방지.
+    단어 경계를 사용하여 'coherences' → '결맞음s' 오치환을 방지.
+    """
+    for eng, kor in sorted(TERM_DICT.items(), key=lambda x: -len(x[0])):
+        text = re.sub(r'(?<![가-힣\w])' + re.escape(eng) + r'(?![가-힣\w])', kor, text)
     return text
 
 
@@ -301,7 +332,8 @@ _BRACE_L2 = r'(?:[^{}]|\{[^{}]*\})*'
 _BRACE_L3 = r'(?:[^{}]|\{' + _BRACE_L2 + r'\})*'
 _BRACE_L4 = r'(?:[^{}]|\{' + _BRACE_L3 + r'\})*'
 _BARE_CMD_ARGS = re.compile(
-    r"(\\(?!begin\b|end\b)[a-zA-Z]+(?:\{" + _BRACE_L4 + r"\}){1,3})"
+    r"(\\(?!begin\b|end\b)[a-zA-Z]+(?:\{" + _BRACE_L4 + r"\}){1,3}"
+    r"(?:[_^]\{(?:[^{}]|\{[^{}]*\})*\})*)"  # trailing subscript/superscript: \vec{k}_{1}
 )
 
 

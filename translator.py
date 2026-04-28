@@ -69,8 +69,8 @@ def translate(paper: dict, config: dict) -> dict:
         translated_block = block.copy()
         btype = block.get("type", "")
 
-        if btype in _SKIP_TYPES:
-            translated_block["translated_text"] = block["text"]
+        if btype in _SKIP_TYPES or block.get("img_path"):
+            translated_block["translated_text"] = block.get("text", "")
         else:
             block_id = block["id"]
             with cache_lock:

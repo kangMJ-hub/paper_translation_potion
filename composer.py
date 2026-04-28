@@ -130,6 +130,15 @@ def _render_template(translated: dict, config: dict) -> str:
         r"[A-Z]{1,3}\s+"             # 이니셜
         r"\d{4}\b",                  # 연도
     )
+    # 이미 [N] 형태로 존재하는 참고문헌 번호 수집 (N] 단편 중복 방지용)
+    _existing_ref_nums = {
+        m.group(1)
+        for b in blocks
+        if b["type"] == "reference"
+        for m in [re.match(r"^\[(\d+)\]", b.get("text", "").strip())]
+        if m
+    }
+
     reclassified: list[dict] = []
     in_ref_sec = False
     for b in blocks:
@@ -139,10 +148,14 @@ def _render_template(translated: dict, config: dict) -> str:
             continue
         if b["type"] == "paragraph":
             text = b.get("text", "").strip()
+            # N] 형태 단편이 이미 [N] reference로 존재하면 중복 제거
+            _bare_m = re.match(r"^(\d{1,2})\]\s*[A-Z]", text)
+            if _bare_m and _bare_m.group(1) in _existing_ref_nums:
+                continue
             is_citation = (
                 in_ref_sec
                 or _citation_pat.match(text)
-                or re.match(r"^\d{1,2}\]\s*[A-Z]", text)  # "19] Welton..."
+                or bool(_bare_m)
             )
             if is_citation:
                 reclassified.append({**b, "type": "reference"})
